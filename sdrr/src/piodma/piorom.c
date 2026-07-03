@@ -542,6 +542,11 @@ static void piorom_load_programs(piorom_config_t *config) {
         APIO_GPIOBASE_16();
     }
 
+    // a_minus_1_pin / a_minus_1_signal_pin feed the A-1 reader SM, currently
+    // #if 0'd out below.  (void) reads mark them intentionally unused for now.
+    (void)a_minus_1_pin;
+    (void)a_minus_1_signal_pin;
+
     // PIO1 SM0 - Address reader
     //
     // Reads address lines and pushes complete ROM table lookup address to the
