@@ -1,6 +1,10 @@
 # CLI Changelog
 
-## v0.1.10 - 2026-??-??
+## v0.1.11 - 2026-07-12
+
+- Prevent program command from allowing --plugin and --firmware simultanesouly (as ---plugins is ignored anyway).
+
+## v0.1.10 - 2026-07-02
 
 - Added more help on size handling when programming or building firmware.
 
