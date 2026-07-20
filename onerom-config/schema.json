@@ -4,6 +4,11 @@
     "description": "One ROM chip configuration format.\n\nUsed to indicate:\n- What ROM chips, RAM chips and any other devices to emulate\n- What ROM images to include\n- Any overrides for the firmware build-time setting",
     "type": "object",
     "properties": {
+        "boot_logging": {
+            "description": "Whether to enable boot logging, using SWD.",
+            "type": "boolean",
+            "default": false
+        },
         "categories": {
             "description": "Optional categories for this configuration, to aid in grouping,\nsorting, and searching of configurations.",
             "type": [
@@ -32,6 +37,13 @@
                 "null"
             ]
         },
+        "instance_name": {
+            "description": "Optional name for this One ROM instance",
+            "type": [
+                "string",
+                "null"
+            ]
+        },
         "name": {
             "description": "Optional name for this configuration.  Is included in the description\noutput by the builder.",
             "type": [
@@ -45,6 +57,23 @@
                 "string",
                 "null"
             ]
+        },
+        "serial_override": {
+            "description": "Optional serial number override for this One ROM, overriding the stock\nUSB serial number (which is the MCU's unique chip ID).",
+            "type": [
+                "string",
+                "null"
+            ]
+        },
+        "swd_enabled": {
+            "description": "Whether to enable SWD.  Must be enabled for boot logging.",
+            "type": "boolean",
+            "default": true
+        },
+        "turbo_boot": {
+            "description": "Whethher to boot fast.  Disables reading the image select jumpers.\nThe first non-plugin image is served.",
+            "type": "boolean",
+            "default": false
         },
         "version": {
             "description": "Configuration format version.",
@@ -61,6 +90,22 @@
             "description": "Chip configuration structure",
             "type": "object",
             "properties": {
+                "allow_cs_ignore": {
+                    "description": "Explicitly permit CS/CE/OE lines to be set to Ignore outside the\ncontexts where this is implicitly allowed:\n  - V2 multi-ROM set chips[1+] (secondary sockets — free pass)\n  - Lines with allow_ignore in chip_types.json (datasheet-defined)\n\nRequired for chip0 in multi-ROM sets and for single-chip sets\nwhere a line needs ignoring for custom circuit reasons.\nMisuse can cause bus contention — only set when intentional.",
+                    "type": "boolean",
+                    "default": false
+                },
+                "ce": {
+                    "description": "Optional Chip Enable logic override - only valid for chip types that\nhave a /CE control line.  In V2 multi-ROM sets, may be set to Ignore\nwhen /CE is tied active and /OE is the fly-leaded chip select, or vice\nversa.  Not valid for V1 configurations.",
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/CsLogic"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
                 "cs1": {
                     "description": "Optional Chip Select 1 logic - only valid for Chip Types that have CS1",
                     "anyOf": [
@@ -85,6 +130,17 @@
                 },
                 "cs3": {
                     "description": "Optional Chip Select 3 logic - only valid for Chip Types that have CS3",
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/CsLogic"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "cs4": {
+                    "description": "Optional Chip Select 4 logic - only valid for Chip Types that have CS4",
                     "anyOf": [
                         {
                             "$ref": "#/$defs/CsLogic"
@@ -138,6 +194,17 @@
                         }
                     ]
                 },
+                "oe": {
+                    "description": "Optional Output Enable logic override - only valid for chip types that\nhave an /OE control line.  Not valid for V1 configurations.",
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/CsLogic"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
                 "size_handling": {
                     "description": "Optional size handling configuration for this Chip.  Used to specify\nhandling when the image supplied isn't the correct size for this Chip\ntype.",
                     "$ref": "#/$defs/SizeHandling"
@@ -156,7 +223,7 @@
             "type": "object",
             "properties": {
                 "chips": {
-                    "description": "Array of chip configurations in this set.  Contains 1 member for single\nchip sets, and multiple members for multi-ROM and banked ROM sets.",
+                    "description": "Array of chip configurations in this set.  Contains 1 member for single\nchip sets, and multiple members for multi-ROM and banked ROM sets.\n\nFor multi-ROM sets, the array order determines X pin assignment:\n  chip0 — primary socket (One ROM physically installed here)\n  chip1 — X1 pin monitors this socket's chip select via fly-lead\n  chip2 — X2 pin monitors this socket's chip select via fly-lead\nMaximum 3 chips per multi-ROM set (primary + 2 X pins).",
                     "type": "array",
                     "items": {
                         "$ref": "#/$defs/ChipConfig"
@@ -243,6 +310,11 @@
                     "description": "512B EPROM with multiple supply voltages - 512 bytes, 24-pin package",
                     "type": "string",
                     "const": "2704"
+                },
+                {
+                    "description": "512B bipolar PROM with three-state outputs and four fixed-polarity chip selects - 512 bytes, 24-pin package",
+                    "type": "string",
+                    "const": "HM7641"
                 },
                 {
                     "description": "1KB EPROM with multiple supply voltages - 1024 bytes, 24-pin package",

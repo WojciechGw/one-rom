@@ -5,7 +5,6 @@
 //! Shared error type for the One ROM CLI library.
 
 use onerom_config::fw::FirmwareVersion;
-use sdrr_fw_parser::SdrrRomType;
 
 use crate::plugin::{PluginType, PluginVersion};
 
@@ -68,7 +67,7 @@ pub enum Error {
     #[error(
         "The operation attempted to access past the end of a live ROM image.\n  The {0} size is {1} bytes"
     )]
-    LiveOutOfBounds(SdrrRomType, usize),
+    LiveOutOfBounds(String, usize),
 
     #[error("Cannot determine the board type.\n  Either --board or --serial must be specified.")]
     NoBoardOrDevice,
@@ -117,7 +116,9 @@ pub enum Error {
     #[error("Unsupported chip type '{0}'.\n  Supported types for this board: {1}")]
     UnsupportedChipType(String, String),
 
-    #[error("This board does not support chip types {1}.\n  Supported types: {2}")]
+    #[error(
+        "This board does not support chip types {1}.\n  Supported types: {2}\n  Use --allow-unsupported-chip-type to override."
+    )]
     UnsupportedBoardChipType(String, String, String),
 
     #[error(
@@ -204,6 +205,16 @@ pub enum Error {
         "ROM image '{0}' has an odd number of bytes ({1}).\n  Byte swapping requires an even-length input file."
     )]
     OddLengthImage(String, usize),
+
+    #[error(
+        "Firmware board type '{0}' does not match the expected board type '{1}'.\n  Use --force to override."
+    )]
+    BoardMismatch(String, String),
+
+    #[error(
+        "Plugin '{0}' version '{1}' is not compatible with firmware {2} or later.\n  The selected firmware version is {3}."
+    )]
+    PluginIncompatibleNewer(String, PluginVersion, FirmwareVersion, FirmwareVersion),
 }
 
 impl Error {
@@ -221,5 +232,59 @@ impl From<onerom_fw::Error> for Error {
 impl From<onerom_config::Error> for Error {
     fn from(e: onerom_config::Error) -> Self {
         Self::Other(format!("{e}"))
+    }
+}
+
+impl From<onerom_app::PluginError> for Error {
+    fn from(p: onerom_app::PluginError) -> Self {
+        use onerom_app::PluginError as P;
+        match p {
+            P::DuplicatePlugin(t) => Error::DuplicatePlugin(t),
+            P::UserPluginWithoutSystem => Error::UserPluginWithoutSystem,
+            P::TooLarge(size, max) => Error::PluginTooLarge(size, max),
+            P::NotFound(name) => Error::PluginNotFound(name),
+            P::VersionNotFound(name, v) => Error::PluginVersionNotFound(name, v.to_string()),
+            P::Incompatible {
+                name,
+                version,
+                min_fw,
+                fw,
+            } => Error::PluginIncompatible(name, version, min_fw, fw),
+            P::IncompatibleNewer {
+                name,
+                version,
+                from,
+                fw,
+            } => Error::PluginIncompatibleNewer(name, version, from, fw),
+            P::BinaryTooSmall(src, actual, min) => Error::PluginBinaryTooSmall(src, actual, min),
+            P::InvalidMagic(src, got, expected) => Error::PluginInvalidMagic(src, got, expected),
+            P::TypeMismatch(src, expected, got) => {
+                Error::PluginTypeMismatch(src, expected.to_string(), got.to_string())
+            }
+            P::VersionMismatch(name, manifest, header) => {
+                Error::PluginVersionMismatch(name, manifest, header)
+            }
+            P::Sha256Mismatch {
+                binary,
+                expected,
+                got,
+            } => Error::PluginSha256Mismatch(binary, expected, got),
+            P::PioNotSupported(src) => Error::PluginPioNotSupported(src),
+            P::UnknownBinaryType(src, v) => Error::PluginUnknownBinaryType(src, v),
+            P::UnknownManifestType(name, ty) => Error::PluginUnknownManifestType(name, ty),
+            P::SpecSyntax(msg) => Error::InvalidArgument("--plugin".to_string(), msg),
+            P::ManifestJson(url, detail) => Error::Json(url, detail),
+        }
+    }
+}
+
+impl From<onerom_app::Error<onerom_fw::Error>> for Error {
+    fn from(e: onerom_app::Error<onerom_fw::Error>) -> Self {
+        match e {
+            // Fetch failures carry onerom-fw's own error; map it as onerom-fw
+            // errors are mapped elsewhere in the CLI (via From<onerom_fw::Error>).
+            onerom_app::Error::Fetch { error, .. } => error.into(),
+            onerom_app::Error::Plugin(p) => p.into(),
+        }
     }
 }

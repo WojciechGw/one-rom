@@ -13,10 +13,20 @@ use onerom_config::chip::{CHIP_TYPE_NAMES_PLUGINS, ChipFunction, ChipType, Contr
 use onerom_config::hw::Board;
 use onerom_gen::{
     ChipConfig, ChipSetConfig, ChipSetType, Config, CsLogic, FireConfig, FireCpuFreq, FireVreg,
-    FirmwareConfig, LedConfig, SizeHandling,
+    FirmwareConfig, LedConfig, SizeHandling, requires_half_select_cs1,
 };
 
 const DEFAULT_CONFIG_DESCRIPTION: &str = "Created by the One ROM CLI";
+
+pub struct GlobalConfig {
+    pub config_name: Option<String>,
+    pub config_description: Option<String>,
+    pub instance_name: Option<String>,
+    pub serial_override: Option<String>,
+    pub boot_logging: Option<bool>,
+    pub disable_swd: Option<bool>,
+    pub turbo_boot: Option<bool>,
+}
 
 /// The result of checking whether any slot specifications require user
 /// confirmation before proceeding.
@@ -25,6 +35,9 @@ pub struct ConfirmationsRequired {
     pub cpu_freq: bool,
     /// True if any slot has a vreg above the stock threshold.
     pub vreg: bool,
+    /// Names of chip types that the board does not support but were permitted
+    /// via `--allow-unsupported-chip-type`. Empty unless the override was used.
+    pub unsupported_chip_types: Vec<String>,
 }
 
 /// Check whether any slot specifications require user confirmation.
@@ -45,6 +58,7 @@ pub fn check_confirmations(slots: &[SlotSpec]) -> ConfirmationsRequired {
                 .map(|v| *v > FireVreg::stock_value())
                 .unwrap_or(false)
         }),
+        unsupported_chip_types: Vec::new(),
     }
 }
 
@@ -55,9 +69,19 @@ pub fn check_confirmations(slots: &[SlotSpec]) -> ConfirmationsRequired {
 pub fn check_slot_confirmations(
     slots: &[String],
     board: &Board,
+    allow_unsupported_chip_type: bool,
 ) -> Result<ConfirmationsRequired, Error> {
-    let parsed = parse_slots(slots, board)?;
-    Ok(check_confirmations(&parsed))
+    let parsed = parse_slots(slots, board, allow_unsupported_chip_type)?;
+    let mut confirmations = check_confirmations(&parsed);
+    // A parsed slot with an unsupported chip type can only be present because
+    // the override was set (parse_slot errors otherwise), so collect these for
+    // the caller to warn about.
+    confirmations.unsupported_chip_types = parsed
+        .iter()
+        .filter(|s| !board.allows_chip_type(s.chip_type))
+        .map(|s| s.chip_type.name().to_string())
+        .collect();
+    Ok(confirmations)
 }
 
 // Handle tilde expansion for file paths in slot specifications, since these
@@ -81,6 +105,7 @@ pub struct SlotSpec {
     pub cs1: Option<CsLogic>,
     pub cs2: Option<CsLogic>,
     pub cs3: Option<CsLogic>,
+    pub cs4: Option<CsLogic>,
     size_handling: Option<SizeHandling>,
     pub cpu_freq: Option<FireCpuFreq>,
     pub vreg: Option<FireVreg>,
@@ -217,6 +242,7 @@ const SLOT_KEYS: &[&str] = &[
     "cs1",
     "cs2",
     "cs3",
+    "cs4",
     "size_handling",
     "size",
     "cpu-freq",
@@ -226,13 +252,24 @@ const SLOT_KEYS: &[&str] = &[
 ];
 
 /// Parse a single `--slot` string into a [`SlotSpec`], validating against the given board.
-fn parse_slot(slot: &str, board: &Board) -> Result<SlotSpec, Error> {
+///
+/// When `allow_unsupported_chip_type` is set, a chip type outside the board's
+/// supported set is permitted rather than rejected; the caller is expected to
+/// warn (see [`ConfirmationsRequired::unsupported_chip_types`]). Board
+/// electrical constraints (e.g. the 40-pin requirement for `force_16bit`) are
+/// unaffected.
+fn parse_slot(
+    slot: &str,
+    board: &Board,
+    allow_unsupported_chip_type: bool,
+) -> Result<SlotSpec, Error> {
     let mut file = None;
     let mut label = None;
     let mut chip_type_str = None;
     let mut cs1 = None;
     let mut cs2 = None;
     let mut cs3 = None;
+    let mut cs4 = None;
     let mut size_handling = None;
     let mut cpu_freq = None;
     let mut vreg = None;
@@ -263,6 +300,7 @@ fn parse_slot(slot: &str, board: &Board) -> Result<SlotSpec, Error> {
             "cs1" => cs1 = Some(parse_cs_logic(slot, key, value)?),
             "cs2" => cs2 = Some(parse_cs_logic(slot, key, value)?),
             "cs3" => cs3 = Some(parse_cs_logic(slot, key, value)?),
+            "cs4" => cs4 = Some(parse_cs_logic(slot, key, value)?),
             "size_handling" | "size" => {
                 size_handling = Some(parse_size_handling(slot, key, value)?)
             }
@@ -299,7 +337,7 @@ fn parse_slot(slot: &str, board: &Board) -> Result<SlotSpec, Error> {
         Error::UnsupportedChipType(chip_type_str.clone(), supported)
     })?;
 
-    if !board.supports_chip_type(chip_type) && !board.extra_chip_types().contains(&chip_type) {
+    if !allow_unsupported_chip_type && !board.allows_chip_type(chip_type) {
         let supported = supported_chip_names_for_board(board);
         return Err(Error::UnsupportedBoardChipType(
             chip_type.name().to_string(),
@@ -315,7 +353,7 @@ fn parse_slot(slot: &str, board: &Board) -> Result<SlotSpec, Error> {
         ));
     }
 
-    validate_cs_lines(slot, &chip_type, cs1, cs2, cs3)?;
+    validate_cs_lines(slot, &chip_type, cs1, cs2, cs3, cs4)?;
 
     if force_16bit.is_some() && board.chip_pins() != 40 {
         return Err(Error::InvalidArgument(
@@ -331,6 +369,7 @@ fn parse_slot(slot: &str, board: &Board) -> Result<SlotSpec, Error> {
         cs1,
         cs2,
         cs3,
+        cs4,
         size_handling,
         cpu_freq,
         vreg,
@@ -339,30 +378,36 @@ fn parse_slot(slot: &str, board: &Board) -> Result<SlotSpec, Error> {
     })
 }
 
-/// Validate that CS lines are provided for all configurable control lines,
-/// and not provided for fixed active-low lines.
+/// Validate the CS lines supplied against the chip type's control lines.
+///
+/// - A `Configurable` line's polarity is mask-programmed at manufacture, so
+///   the user must state it.
+/// - A fixed line's polarity is set by the silicon, so the user must not
+///   state it. `ignore` is not a polarity - it says this One ROM does not
+///   monitor the line - so it stays permitted here and is policed by
+///   `check_cs_v2`'s `allow_cs_ignore` rules.
+/// - A line the chip type does not have must not be specified, except `cs1`
+///   on a chip needing a half-select (see `requires_half_select_cs1`), where
+///   `cs1` names the excess top address line rather than a pin. `check_cs_v2`
+///   requires it there.
 fn validate_cs_lines(
     slot: &str,
     chip_type: &ChipType,
     cs1: Option<CsLogic>,
     cs2: Option<CsLogic>,
     cs3: Option<CsLogic>,
+    cs4: Option<CsLogic>,
 ) -> Result<(), Error> {
-    let cs_values = [
-        ("cs1", cs1.is_some()),
-        ("cs2", cs2.is_some()),
-        ("cs3", cs3.is_some()),
-    ];
+    let cs_values = [("cs1", cs1), ("cs2", cs2), ("cs3", cs3), ("cs4", cs4)];
 
     for line in chip_type.control_lines() {
         let supplied = cs_values
             .iter()
             .find(|(name, _)| *name == line.name)
-            .map(|(_, v)| *v)
-            .unwrap_or(false);
+            .and_then(|(_, v)| *v);
 
         match line.line_type {
-            ControlLineType::Configurable if !supplied => {
+            ControlLineType::Configurable if supplied.is_none() => {
                 return Err(Error::InvalidArgument(
                     "--slot".to_string(),
                     format!(
@@ -372,12 +417,19 @@ fn validate_cs_lines(
                     ),
                 ));
             }
-            ControlLineType::FixedActiveLow if supplied => {
+            ControlLineType::FixedActiveLow | ControlLineType::FixedActiveHigh
+                if matches!(supplied, Some(logic) if logic != CsLogic::Ignore) =>
+            {
                 return Err(Error::InvalidArgument(
                     "--slot".to_string(),
                     format!(
-                        "Chip type {} has fixed active-low {}, do not specify it\n    --slot '{slot}'",
+                        "Chip type {} has fixed {} {}, do not specify it\n    --slot '{slot}'",
                         chip_type.name(),
+                        if line.line_type == ControlLineType::FixedActiveHigh {
+                            "active-high"
+                        } else {
+                            "active-low"
+                        },
                         line.name
                     ),
                 ));
@@ -386,8 +438,14 @@ fn validate_cs_lines(
         }
     }
 
-    for (cs_name, has_val) in &cs_values {
-        if *has_val && !chip_type.control_lines().iter().any(|l| l.name == *cs_name) {
+    for (cs_name, user) in &cs_values {
+        // On an oversized chip, cs1 names the excess top address line acting
+        // as a half-select, not a control line - its absence from
+        // control_lines() is expected, and check_cs_v2 requires it.
+        if *cs_name == "cs1" && requires_half_select_cs1(chip_type) {
+            continue;
+        }
+        if user.is_some() && !chip_type.control_lines().iter().any(|l| l.name == *cs_name) {
             return Err(Error::InvalidArgument(
                 "--slot".to_string(),
                 format!(
@@ -413,8 +471,15 @@ pub fn supported_chip_names_for_board(board: &Board) -> String {
 
 /// Parse all `--slot` strings against a resolved board, returning a vec of
 /// [`SlotSpec`] or the first error.
-pub fn parse_slots(slots: &[String], board: &Board) -> Result<Vec<SlotSpec>, Error> {
-    slots.iter().map(|s| parse_slot(s, board)).collect()
+pub fn parse_slots(
+    slots: &[String],
+    board: &Board,
+    allow_unsupported_chip_type: bool,
+) -> Result<Vec<SlotSpec>, Error> {
+    slots
+        .iter()
+        .map(|s| parse_slot(s, board, allow_unsupported_chip_type))
+        .collect()
 }
 
 fn slot_to_chip_config(slot: &SlotSpec) -> ChipConfig {
@@ -426,10 +491,14 @@ fn slot_to_chip_config(slot: &SlotSpec) -> ChipConfig {
         cs1: slot.cs1,
         cs2: slot.cs2,
         cs3: slot.cs3,
+        cs4: slot.cs4,
+        ce: None,
+        oe: None,
         size_handling: slot.size_handling.clone().unwrap_or_default(),
         extract: None,
         label: slot.label.clone(),
         location: None,
+        allow_cs_ignore: false,
     }
 }
 
@@ -462,14 +531,13 @@ fn slot_to_firmware_overrides(slot: &SlotSpec) -> Option<FirmwareConfig> {
 /// slot specs.
 ///
 /// Plugin chip_sets are inserted first (system plugin at index 0, user plugin
-/// at index 1, matching [`plugin_to_chip_set_json`] semantics).  ROM slot
+/// at index 1).  ROM slot
 /// chip_sets follow from index 0 or 2 onwards depending on how many plugins
 /// are present.
 pub fn slots_to_config_json(
     plugins: &[ResolvedPlugin],
     slots: &[SlotSpec],
-    name: Option<&str>,
-    description: Option<&str>,
+    global_config: Option<&GlobalConfig>,
 ) -> Result<String, Error> {
     // Ensure system plugins alway come first
     let mut sorted_plugins: Vec<&ResolvedPlugin> = plugins.iter().collect();
@@ -477,7 +545,7 @@ pub fn slots_to_config_json(
 
     let mut chip_sets: Vec<ChipSetConfig> = sorted_plugins
         .iter()
-        .map(|p| plugin_to_chip_set_config(&p.file, p.plugin_type, p.size))
+        .map(|p| plugin_to_chip_set_config(&p.file(), p.plugin_type, p.size))
         .collect::<Result<Vec<_>, _>>()?;
 
     for slot in slots {
@@ -492,14 +560,20 @@ pub fn slots_to_config_json(
 
     let config = Config {
         version: 1,
-        name: name.map(|s| s.to_string()),
-        description: description
-            .unwrap_or(DEFAULT_CONFIG_DESCRIPTION)
+        name: global_config.and_then(|c| c.config_name.clone()),
+        description: global_config
+            .and_then(|c| c.config_description.clone())
+            .unwrap_or(DEFAULT_CONFIG_DESCRIPTION.to_string())
             .to_string(),
         detail: None,
         chip_sets,
         notes: None,
         categories: None,
+        instance_name: global_config.and_then(|c| c.instance_name.clone()),
+        serial_override: global_config.and_then(|c| c.serial_override.clone()),
+        boot_logging: global_config.is_some_and(|c| c.boot_logging.unwrap_or(false)),
+        swd_enabled: !global_config.is_some_and(|c| c.disable_swd.unwrap_or(false)),
+        turbo_boot: global_config.is_some_and(|c| c.turbo_boot.unwrap_or(false)),
     };
 
     serde_json::to_string_pretty(&config).map_err(|e| Error::Other(e.to_string()))

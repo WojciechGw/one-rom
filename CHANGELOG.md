@@ -2,6 +2,44 @@
 
 All notables changes between versions are documented in this file.
 
+## v0.7.0 - 2026-??-??
+
+This release includes a significant rewrite of the One ROM firmware focusing on Fire boards.
+
+The primary benefit of this firmware in the immediate term is more efficient use of flash for specific ROM types - in many cases, with the later board types, the amount of flash used to store a ROM image is the same as the ROM image size itself, unlike previous releases.
+
+There is also a longer term benefit of reduced maintainability costs and also lower costs to add new ROM types in the future - meaning a better user experience.
+
+Ice boards are capped at firmware v0.6.xx (and are not supported in v0.7.0+).  The programming tools continue to support Ice boards and v0.6.xx.
+
+TODO
+- Figure out why status LED is off on v0.7.0
+
+TO TEST
+- All ROM types live
+- Host control plugin
+
+Retired:
+- `lab` (and replaced by `onerom-lab`)
+- `sdrr-check` (superceded by `onerom-fw-tester`)
+- `sdrr-info` (superceded by the CLI `onerom firmware inspect` command)
+- `sdrr-tester` (superceded by `onerom-lab`)
+- `test` (superceded by `onerom-fw-tester`)
+- Silent replacement of SST39SF040 with 27C040 for fire-32-a.  Decided it was best to flag this isn't natively supported.
+
+New:
+- `onerom-app` crate, containing functionality shared between One ROM user facing apps, like CLI, Studio and the Web UI (via onerom-wasm).
+
+Updated:
+- All Rust crates and programming tools
+- plugins/system/usb
+- plugins/user/host-control
+- CI to perform comprehensive testing of the firmware, for all ROM types, and dynamically banked and multi-ROM sets, and PIO focused plugin API functions
+
+Limitations:
+- SRAM support (6116) is not currently supported by the v0.7.xx firmware train.  This limitation is expected to be lifted in future.
+- One ROM Lens has not been tested with this release, and is likely broken.
+
 ## 2026-07-04
 
 Release hardware design files for new variants:
@@ -26,6 +64,7 @@ Added:
 - HN62402 (128KBx16/256x8) support for fire-40-a.  Uses 512KB on flash.
 - Support for prototypes fire-28-c and fire-32-b.
 - SST39SF040 support (fire-32-b only).  Uses 512KB on flash.
+- Firmware decoding support from
 
 Fixed:
 - 23C1010 support - there were failures when creating firmware with 23C1010.

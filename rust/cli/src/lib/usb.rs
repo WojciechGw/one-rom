@@ -9,8 +9,8 @@
 
 #[allow(unused_imports)]
 use log::{debug, warn};
+use onerom_fw_parser::Parser;
 use picoboot::{Picoboot, Reader as PicobootReader, Target, usb::Timeouts};
-use sdrr_fw_parser::Parser;
 use std::time::Duration;
 
 use crate::Error;
@@ -130,9 +130,9 @@ pub async fn read_device_info(device: &mut Device) -> Result<(), Error> {
     let picoboot = get_picoboot(device, false).await?;
     let mut reader = PicobootReader::new(picoboot).await.map_err(Error::Usb)?;
 
-    // Parse the flash to get the device information
+    // Parse the device information, handling either firmware format.
     let mut parser = Parser::with_base_flash_address(&mut reader, FLASH_BASE, RAM_BASE);
-    let onerom = parser.parse().await;
+    let onerom = parser.parse_device().await;
     device.update_onerom(onerom);
 
     Ok(())

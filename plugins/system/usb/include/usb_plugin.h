@@ -20,11 +20,12 @@ typedef struct {
     ora_debug_log_fn_t debug;
     ora_err_log_fn_t err_log;
     ora_set_status_led_fn_t set_status_led;
+    ora_get_active_ram_slot_fn_t get_active_ram_slot;
+    ora_get_ram_slot_info_fn_t get_ram_slot_info;
+    ora_read_ram_rom_slot_fn_t read_ram_rom_slot;
+    ora_reprogram_ram_rom_slot_fn_t reprogram_ram_rom_slot;
     uint32_t timer_ms;
-    const sdrr_runtime_info_t *runtime;
-    const sdrr_info_t *firmware;
-    ora_get_chip_size_from_type_fn_t get_chip_size_from_type;
-    const sdrr_rom_set_t *active_rom_set;
+    const onerom_runtime_info_t *runtime;
     onerom_pending_t pending;
     led_status_t led_status;
 } usb_plugin_context_t;

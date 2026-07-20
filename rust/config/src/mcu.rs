@@ -2,6 +2,13 @@
 //
 // MIT License
 
+pub const STM32F4_BASE_FLASH: u32 = 0x0800_0000;
+pub const RP235X_BASE_FLASH: u32 = 0x1000_0000;
+pub const RP235X_END_FLASH: u32 = 0x1FFF_FFFF;
+pub const RP235X_SRAM_SIZE_KB: usize = 520;
+pub const RP235X_BASE_SRAM: u32 = 0x2000_0000;
+pub const RP235X_END_SRAM: u32 = RP235X_BASE_SRAM + (RP235X_SRAM_SIZE_KB as u32 * 1024);
+
 /// MCU family
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Family {
@@ -16,8 +23,8 @@ pub enum Family {
 impl Family {
     pub const fn get_flash_base(&self) -> u32 {
         match self {
-            Family::Stm32f4 => 0x0800_0000,
-            Family::Rp2350 => 0x1000_0000,
+            Family::Stm32f4 => STM32F4_BASE_FLASH,
+            Family::Rp2350 => RP235X_BASE_FLASH,
         }
     }
 
@@ -67,6 +74,23 @@ impl core::fmt::Display for Port {
             Port::B => write!(f, "PORT_B"),
             Port::C => write!(f, "PORT_C"),
             Port::D => write!(f, "PORT_D"),
+        }
+    }
+}
+
+// Values match C enum values in core firmware
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum RpVariant {
+    Rp235xA = 1,
+    Rp235xB = 0,
+}
+
+impl core::fmt::Display for RpVariant {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RpVariant::Rp235xA => write!(f, "RP235xA"),
+            RpVariant::Rp235xB => write!(f, "RP235xB"),
         }
     }
 }
@@ -255,8 +279,8 @@ impl Variant {
             Variant::F405RG => 128, // +64KB CCM RAM
             Variant::F401RB | Variant::F401RC => 64,
             Variant::F401RE => 96,
-            Variant::RP2350 => 520,
-            Variant::RP2350B => 520,
+            Variant::RP2350 => RP235X_SRAM_SIZE_KB,
+            Variant::RP2350B => RP235X_SRAM_SIZE_KB,
         }
     }
 

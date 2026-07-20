@@ -1,83 +1,39 @@
-# One ROM Lab
+# One ROM Lab NEW
 
-One ROM Lab firmware reads ROM images from external ROM chips (originals, One ROMs, and other replacements), by using the One ROM hardware with female socket placed on top of the ROM socket pins.  It can also be used to instrument the performance of these external ROM chips, by using additional equipment, such as logic analyzers or oscilloscopes.
+A new version of One ROM Lab, rebuilt:
+- Fire (RP2350) only
+- Primary use case is currently reading external ROMs
 
-<div class="video-container">
-    <iframe 
-        width="560" 
-        height="315" 
-        src="https://www.youtube.com/embed/9QBlPToP_BQ" 
-        frameborder="0" 
-        allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" 
-        allowfullscreen>
-    </iframe>
-</div>
+In time it is expected this will replace the existing Lab implementation.
 
-You need female headers on the top of your One ROM PCB in order to use the Lab firmware. 
-
-One ROM Lab currently only support STM32F4 based One ROMs - a RP2350 is viable, with the appropriate changes to support `embassy-rp`.
-
-## Validating One ROMs
-
-The current primary use case for lab is to validate One ROMs before shipping them to customers.  This is done by reading the ROM image, calculating its SHA1 hash, and comparing it to the expected hash from the database.
-
-To build One ROM Lab firmware for validating 24 pin One ROMs (with lab running on hw revision ice-24-usb-h) use:
+Use the `scripts/flash.sh` script to build and flash the firmware to the test board, specifying which ROM type to read.  For example:
 
 ```bash
-cargo build --no-default-features --features validate-24-ice --target thumbv7em-none-eabihf --bin onerom-lab
+scripts/flash.sh # Requires entering board type using the menu prompt
+scripts/flash.sh fire-24-e
+scripts/flash.sh fire-28-a
+scripts/flash.sh fire-32-a
+scripts/flash.sh fire-40-a
 ```
 
-To build One ROM Lab firmware for validating 28 pin One ROMs (with lab running on hw revision fire-28-a) use:
+Sample output from a One ROM 40 test serving [images/test/rand_512KB.rom](../../images/test/rand_512KB.rom).
 
-```bash
-cargo build --no-default-features --features validate-28-fire --target thumbv8m.main-none-eabihf --bin onerom-lab-fire
+```text
+14:47:51.720: INFO  [onerom_lab_fire] -----
+14:47:52.666: INFO  [onerom_lab_fire] Reading 27C400 ...
+14:47:59.898: INFO  [onerom_lab_fire] 8-bit  SHA1: d98ec9a8375cf3d3000fccdec176849c25feb34e checksum: 0x03FB87C9
+14:47:59.898: INFO  [onerom_lab_fire] 16-bit SHA1: d98ec9a8375cf3d3000fccdec176849c25feb34e checksum: 0x03FB87C9
+14:47:59.898: INFO  [onerom_lab_fire] Match: true
+14:47:59.898: INFO  [onerom_lab_fire] Tristate failures: 8-bit: 0 16-bit: 0
+14:47:59.898: INFO  [onerom_lab_fire] -----
 ```
 
-Note that the 28 pin Fire version does not currently support USB.
+Dissecting the output:
 
-## Modes
+- Both 8-bit and 16-bit SHA1 and 32-bit summing checksums should match and be the correct value for the ROM being served.
 
-There are a number of modes of operation:
-- **Control** - **default** - is controlled via an external device using SWD.  When paired with `Airfrog` this allows the user to manually trigger ROM Reads using Airfrog's web UI.
-- **One-shot** - reads a ROM image once at startup and then stops.  This is useful for automated testing, or for use in environments where SWD is not available.  In this mode, ROM information is output via RTT.
-- **Continuous** - continuously reads a ROM image in a loop, with a brief pause between reads.
-- **QA** - similar to continuous, used to .
+  Timings are relatively aggressive checking that both words and bytes are served.
 
-These modes are mutually exclusive, and are selected at [build](#building) time using Cargo features.
+- Tristate failures should be 0.
 
-## Building
-
-There are different features to support:
-- Different STM32F4 variants
-- Different [modes](#modes)
-
-Supported STM32F4 variants:
-- `f401re`
-- `f405rg` - **default**
-- `f411re`
-- `f446re`
-
-Modes:
-- `control` - **default** - controlled via SWD (e.g. Airfrog UI)
-- `oneshot` - reads a ROM image once at startup and then stops
-- `repeat` - continuously reads an attached ROM image in a loop
-- `qa` - similar to repeat, designed for QA testing One ROMs
-
-Example build commands:
-
-```bash
-cargo build --release --no-default-features --features f411re,qa,usb
-cargo build --release --no-default-features --features f405rg,control
-cargo build --release --no-default-features --features f411re,oneshot
-cargo build --release --no-default-features --features f446re,repeat
-```
-
-## Flashing
-
-If using `probe-rs` use `cargo run` instead of `cargo build` to automatically flash the firmware after building:
-
-```bash
-cargo build --release --no-default-features --features f405rg,control
-cargo build --release --no-default-features --features f411re,oneshot
-cargo build --release --no-default-features --features f446re,repeat
-```
+  This covers each of /OE and /CE independently being driven high and checking that the data lines are tristated - pulled down using the test board's internal pulls.  The timing for checking tri-stating is relatively relaxed to overcome weak-pulls and any capacitance/inductance of the test setup (e.g. pogo pins).

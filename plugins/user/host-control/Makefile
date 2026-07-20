@@ -9,12 +9,12 @@ OBJDUMP := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-objdump,arm-none-eabi-ob
 
 MAJOR_VERSION := 0
 MINOR_VERSION := 1
-PATCH_VERSION := 0
+PATCH_VERSION := 1
 BUILD_VERSION := 0
 
-ORA_DIR := ../../../sdrr/ora
+ORA_DIR := ../../../firmware/ora
 ORA_INCLUDE := -I$(ORA_DIR)
-SDRR_INCLUDE := -I../../../sdrr/include -I../../../output
+SDRR_INCLUDE := -I../../../firmware/include -I../../../firmware/generated
 PLUGIN_INCLUDE := -I.
 
 BUILD_DIR := build

@@ -11,14 +11,15 @@ use onerom_config::hw::Board;
 use onerom_config::mcu::Variant;
 use onerom_fw::net::{Release, Releases, fetch_license_async};
 use onerom_fw::{assemble_firmware, get_rom_files_async, read_rom_config, validate_sizes};
+use onerom_fw_parser::{ParsedDevice, Parser, readers::MemoryReader};
 use onerom_gen::{Builder, FIRMWARE_SIZE, License};
-use sdrr_fw_parser::{Parser, SdrrInfo, readers::MemoryReader};
 
 use crate::args;
 use crate::utils::{resolve_board, resolve_firmware_output};
 use onerom_cli::plugin::{PluginSpec, ResolvedPlugin, resolve_plugins};
 use onerom_cli::slot::{
-    ConfirmationsRequired, check_slot_confirmations, parse_slots, save_config, slots_to_config_json,
+    ConfirmationsRequired, GlobalConfig, check_slot_confirmations, parse_slots, save_config,
+    slots_to_config_json,
 };
 use onerom_cli::{Error, Options};
 
@@ -34,33 +35,94 @@ pub fn resolve_config_json(
     slots: &[String],
     no_config: bool,
     board: &Board,
-    config_name: Option<&str>,
-    config_description: Option<&str>,
+    global_config: Option<&GlobalConfig>,
     plugins: &[ResolvedPlugin],
+    allow_unsupported_chip_type: bool,
 ) -> Result<String, Error> {
     if let Some(path) = config_file {
         // --config-file is mutually exclusive with --plugin at the args level,
         // so plugins is always empty here.
-        read_rom_config(path).map_err(Error::from)
+        let json = read_rom_config(path)?;
+        if let Some(overrides) = global_config {
+            apply_global_overrides(json, overrides)
+        } else {
+            Ok(json)
+        }
     } else if no_config || slots.is_empty() {
-        slots_to_config_json(plugins, &[], config_name, config_description)
+        slots_to_config_json(plugins, &[], global_config)
     } else {
-        let parsed = parse_slots(slots, board)?;
-        slots_to_config_json(plugins, &parsed, config_name, config_description)
+        let parsed = parse_slots(slots, board, allow_unsupported_chip_type)?;
+        slots_to_config_json(plugins, &parsed, global_config)
     }
+}
+
+fn apply_global_overrides(json: String, global_config: &GlobalConfig) -> Result<String, Error> {
+    let mut value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| Error::Other(format!("Failed to parse config JSON: {e}")))?;
+
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| Error::Other("Config JSON root is not an object".to_string()))?;
+
+    if let Some(v) = &global_config.config_name {
+        obj.insert("name".to_string(), v.clone().into());
+    }
+    if let Some(v) = &global_config.config_description {
+        obj.insert("description".to_string(), v.clone().into());
+    }
+    if let Some(v) = &global_config.instance_name {
+        obj.insert("instance_name".to_string(), v.clone().into());
+    }
+    if let Some(v) = &global_config.serial_override {
+        obj.insert("serial_override".to_string(), v.clone().into());
+    }
+    if let Some(v) = global_config.boot_logging {
+        obj.insert("boot_logging".to_string(), v.into());
+    }
+    if let Some(v) = global_config.disable_swd {
+        obj.insert("swd_enabled".to_string(), (!v).into());
+    }
+    if let Some(v) = global_config.turbo_boot {
+        obj.insert("turbo_boot".to_string(), v.into());
+    }
+
+    serde_json::to_string(&value)
+        .map_err(|e| Error::Other(format!("Failed to re-serialize config JSON: {e}")))
 }
 
 // ------------------------------- Firmware parsing and sizing -------------------------------
 
+#[allow(clippy::collapsible_if)]
 pub async fn verify_assembled_firmware(
     options: &Options,
     data: &[u8],
     force: bool,
+    expected_board: Option<Board>,
 ) -> Result<(), Error> {
     let info = parse_firmware(data).await?;
-    if !info.parse_errors.is_empty() {
+
+    if let (Some(expected), Some(actual)) = (expected_board, info.get_board()) {
+        if actual != expected {
+            if force {
+                eprintln!(
+                    "Warning: firmware board type '{}' does not match expected '{}' (continuing due to --force)",
+                    actual.name(),
+                    expected.name()
+                );
+            } else {
+                return Err(Error::BoardMismatch(
+                    expected.name().to_string(),
+                    actual.name().to_string(),
+                ));
+            }
+        } else if options.verbose {
+            println!("Board match confirmed: {}", expected.name());
+        }
+    }
+
+    if !info.parse_errors().is_empty() {
         let detail = info
-            .parse_errors
+            .parse_errors()
             .iter()
             .map(|e| format!("  {e}"))
             .collect::<Vec<_>>()
@@ -72,21 +134,23 @@ pub async fn verify_assembled_firmware(
             return Err(Error::FirmwareValidation(detail));
         }
     } else if options.verbose {
-        println!(
-            "Assembled firmware version {} parsed successfully with no errors",
-            info.version
-        );
+        if let Some(version) = info.version() {
+            println!(
+                "Assembled firmware version {} parsed successfully with no errors",
+                version
+            );
+        }
     }
     Ok(())
 }
 
-pub async fn parse_firmware(data: &[u8]) -> Result<SdrrInfo, Error> {
+pub async fn parse_firmware(data: &[u8]) -> Result<ParsedDevice, Error> {
     // The hardcoded base address looks odd here, as the STM32's base flash
-    // address, but when using a memory reader, sdrr-fw-parse will just figure
+    // address, but when using a memory reader, onerom-fw-parser will just figure
     // it out for itself based on what it finds in the image.
     let mut reader = MemoryReader::new(data.to_vec(), 0x0800_0000);
     let mut parser = Parser::new(&mut reader);
-    parser.parse_flash().await.map_err(Error::Other)
+    Ok(parser.parse_device().await)
 }
 
 fn check_firmware_size(options: &Options, data: &[u8]) -> Result<(), Error> {
@@ -142,11 +206,14 @@ async fn acquire_local_firmware(
     let data = std::fs::read(firmware).map_err(|e| Error::io(firmware, e))?;
     check_firmware_size(options, &data)?;
     let info = parse_firmware(&data).await?;
-    let version_str = format!("{}", info.version);
+    let version = info
+        .version()
+        .ok_or_else(|| Error::Other("Could not determine firmware version".to_string()))?;
+    let version_str = format!("{}", version);
     if options.verbose {
         println!("Detected firmware version: {version_str}");
     }
-    Ok((data, info.version, version_str))
+    Ok((data, version, version_str))
 }
 
 async fn acquire_release_firmware(
@@ -250,14 +317,20 @@ pub async fn cmd_build(
     let mcu = Variant::RP2350;
 
     if !args.slot.is_empty() {
-        let confirmations = check_slot_confirmations(&args.slot, &board)?;
+        let confirmations =
+            check_slot_confirmations(&args.slot, &board, args.allow_unsupported_chip_type)?;
         confirm_slot_overrides(options, &confirmations).await?;
     }
 
     let (firmware_data, version, version_str) =
         acquire_firmware(options, &args.base_firmware, &args.version, &board, &mcu).await?;
 
-    let plugins = resolve_plugins(&parse_plugin_specs(&args.plugin)?, Some(version)).await?;
+    let plugins = resolve_plugins(
+        &parse_plugin_specs(&args.plugin)?,
+        &version,
+        &onerom_cli::CliFetch,
+    )
+    .await?;
     if options.verbose {
         for plugin in &plugins {
             println!(
@@ -265,19 +338,32 @@ pub async fn cmd_build(
                 plugin.plugin_type.short(),
                 plugin.name,
                 plugin.version,
-                plugin.file,
+                plugin.file(),
             );
         }
     }
 
+    let global_config = if args.no_config {
+        None
+    } else {
+        Some(GlobalConfig {
+            config_name: args.config_name.clone(),
+            config_description: args.config_description.clone(),
+            instance_name: args.instance_name.clone(),
+            serial_override: args.serial_override.clone(),
+            boot_logging: args.logging,
+            disable_swd: args.disable_swd,
+            turbo_boot: args.turbo_boot,
+        })
+    };
     let config_json = resolve_config_json(
         args.config_file.as_deref(),
         &args.slot,
         args.no_config,
         &board,
-        args.config_name.as_deref(),
-        args.config_description.as_deref(),
+        global_config.as_ref(),
         &plugins,
+        args.allow_unsupported_chip_type,
     )?;
 
     if let Some(path) = &args.save_config {
@@ -294,7 +380,7 @@ pub async fn cmd_build(
 
     let assembled = assemble_firmware(firmware_data, metadata, image_data)?;
     let size = assembled.len();
-    verify_assembled_firmware(options, &assembled, args.force).await?;
+    verify_assembled_firmware(options, &assembled, args.force, Some(board)).await?;
 
     let out = resolve_firmware_output(
         &args.output,
@@ -354,11 +440,19 @@ pub async fn accept_license(options: &Options, license: &License) -> Result<(), 
 /// Prompt the user for confirmation if any slot overrides require it.
 ///
 /// CPU frequencies above 150MHz and vreg voltages above 1.10V each require
-/// separate confirmation. Both are suppressed by `--yes`.
+/// separate confirmation. Both are suppressed by `--yes`. Any chip types
+/// permitted via `--allow-unsupported-chip-type` are also surfaced here as a
+/// warning (not suppressed, since it is informational rather than a prompt).
 pub async fn confirm_slot_overrides(
     options: &Options,
     confirmations: &ConfirmationsRequired,
 ) -> Result<(), Error> {
+    for chip_type in &confirmations.unsupported_chip_types {
+        eprintln!(
+            "Warning: chip type {chip_type} is not supported by this board - proceeding anyway (--allow-unsupported-chip-type)"
+        );
+    }
+
     if confirmations.cpu_freq {
         if options.yes {
             println!("Auto-accepted above-stock CPU frequency (--yes)");
@@ -447,17 +541,32 @@ async fn inspect_release_firmware(
         .map_err(Error::from)
 }
 
-fn print_firmware_info(options: &Options, info: &SdrrInfo) -> Result<(), Error> {
-    if !info.parse_errors.is_empty() {
+fn print_firmware_info(options: &Options, info: &ParsedDevice) -> Result<(), Error> {
+    if !info.parse_errors().is_empty() {
         eprintln!("Warning: firmware parsed with errors:");
-        for error in &info.parse_errors {
+        for error in info.parse_errors() {
             eprintln!("  {error}");
         }
         eprintln!();
     }
 
+    match info {
+        ParsedDevice::Original(sdrr) => print_original_firmware_info(options, sdrr),
+        ParsedDevice::Schema(onerom) => print_schema_firmware_info(options, onerom),
+    }
+}
+
+fn print_original_firmware_info(
+    options: &Options,
+    sdrr: &onerom_fw_parser::Sdrr,
+) -> Result<(), Error> {
+    let Some(info) = sdrr.flash.as_ref() else {
+        println!("(no flash information available)");
+        return Ok(());
+    };
+
     if options.verbose {
-        let json = serde_json::to_string_pretty(&info).map_err(|e| Error::Other(e.to_string()))?;
+        let json = serde_json::to_string_pretty(info).map_err(|e| Error::Other(e.to_string()))?;
         println!("---");
         println!("{json}");
     } else {
@@ -474,6 +583,43 @@ fn print_firmware_info(options: &Options, info: &SdrrInfo) -> Result<(), Error> 
                 println!("    ROM {j}: {} {name}", rom.rom_type);
             }
         }
+    }
+    Ok(())
+}
+
+fn print_schema_firmware_info(
+    options: &Options,
+    onerom: &onerom_fw_parser::OneRom,
+) -> Result<(), Error> {
+    let Some(info) = onerom.info() else {
+        println!("(no firmware information available)");
+        return Ok(());
+    };
+
+    let board = onerom
+        .metadata()
+        .and_then(|m| Board::try_from_str(m.hw.hw_rev.as_str()));
+    let board_name = board.map_or("unknown".to_string(), |b| b.name().to_string());
+    if options.verbose {
+        println!(
+            "Version:  {}.{}.{}",
+            info.major_version, info.minor_version, info.patch_version
+        );
+        println!("Build:    {}", info.build_number);
+        println!("Format:   Schema (v0.7.0+)");
+        println!("Board:    {board_name}");
+        if let Some(metadata) = onerom.metadata() {
+            println!("Slots: {}", metadata.rom_slot_count);
+            for (i, slot) in metadata.rom_slots.iter().enumerate() {
+                println!("  Slot {i}: {} ROM(s)", slot.rom_count);
+            }
+        }
+    } else {
+        println!(
+            "Version:  {}.{}.{}",
+            info.major_version, info.minor_version, info.patch_version
+        );
+        println!("Board:    {board_name}");
     }
     Ok(())
 }
@@ -650,5 +796,5 @@ pub async fn cmd_download(
 }
 
 fn parse_plugin_specs(raw: &[String]) -> Result<Vec<PluginSpec>, Error> {
-    onerom_cli::plugin::parse_plugins(raw)
+    Ok(onerom_cli::plugin::parse_plugins(raw)?)
 }

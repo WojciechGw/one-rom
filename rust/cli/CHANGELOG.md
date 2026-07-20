@@ -1,5 +1,10 @@
 # CLI Changelog
 
+## v0.2.0 - 2026-??-??
+
+- Support firmware v0.7.x
+- Move plugin handling to onerom-app crate.
+
 ## v0.1.11 - 2026-07-12
 
 - Prevent program command from allowing --plugin and --firmware simultanesouly (as ---plugins is ignored anyway).

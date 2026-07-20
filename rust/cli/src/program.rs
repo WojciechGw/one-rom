@@ -16,7 +16,7 @@ use crate::firmware::{
 use crate::utils::{check_device, resolve_board};
 use onerom_cli::device::select_device;
 use onerom_cli::plugin::{parse_plugins, resolve_plugins};
-use onerom_cli::slot::{check_slot_confirmations, save_config};
+use onerom_cli::slot::{GlobalConfig, check_slot_confirmations, save_config};
 use onerom_cli::usb::{RebootArgs, flash_program, flash_program_read, reboot};
 use onerom_cli::{Error, Options};
 
@@ -96,16 +96,31 @@ async fn build_and_assemble(
     let (firmware_data, version, _version_str) =
         acquire_firmware(options, &args.base_firmware, &args.version, board, mcu).await?;
 
-    let plugins = resolve_plugins(&parse_plugins(&args.plugin)?, Some(version)).await?;
+    let plugins = resolve_plugins(
+        &parse_plugins(&args.plugin)?,
+        &version,
+        &onerom_cli::CliFetch,
+    )
+    .await?;
+
+    let global_config = GlobalConfig {
+        config_name: args.config_name.clone(),
+        config_description: args.config_description.clone(),
+        instance_name: args.instance_name.clone(),
+        serial_override: args.serial_override.clone(),
+        boot_logging: args.logging,
+        disable_swd: args.disable_swd,
+        turbo_boot: args.turbo_boot,
+    };
 
     let config_json = resolve_config_json(
         args.config_file.as_deref(),
         &args.slot,
         args.no_config,
         board,
-        args.config_name.as_deref(),
-        args.config_description.as_deref(),
+        Some(&global_config),
         &plugins,
+        args.allow_unsupported_chip_type,
     )?;
 
     if let Some(path) = &args.save_config {
@@ -217,12 +232,13 @@ pub async fn cmd_program(
     if let Some(b) = &board
         && !args.slot.is_empty()
     {
-        let confirmations = check_slot_confirmations(&args.slot, b)?;
+        let confirmations =
+            check_slot_confirmations(&args.slot, b, args.allow_unsupported_chip_type)?;
         confirm_slot_overrides(options, &confirmations).await?;
     }
 
     let data = acquire_program_image(options, args, &board, &mcu).await?;
-    verify_assembled_firmware(options, &data, args.force).await?;
+    verify_assembled_firmware(options, &data, args.force, board).await?;
 
     loop {
         if let Some(out) = &args.output {
@@ -243,6 +259,7 @@ pub async fn cmd_program(
             if let Some(device) = options.device.as_ref() {
                 println!("Reading device after programming...");
                 crate::inspect::output_slot_info(device, options, "")
+                    .await
                     .inspect_err(|_| log::error!("Failed to read slots after programming"))?;
             } else {
                 eprintln!("Failed to read device after programming");

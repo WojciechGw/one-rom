@@ -30,7 +30,7 @@ use crate::meta::{
     CHIP_SET_FIRMWARE_OVERRIDES_METADATA_LEN, CHIP_SET_METADATA_LEN,
     CHIP_SET_METADATA_LEN_EXTRA_INFO,
 };
-use crate::{Error, Result, builder::FirmwareConfig};
+use crate::{Error, FirmwareConfig, Location, Result};
 use crate::{MIN_FIRMWARE_OVERRIDES_VERSION, PAD_METADATA_BYTE};
 
 /// Value to use when told to pad a Chip image
@@ -47,6 +47,11 @@ const CHIP_METADATA_LEN_WITH_FILENAME: usize = 8;
 
 // From 0.6.3 28 pin Fire boards report 18 address pins, up from 16.
 const MIN_FW_VER_FIRE_28_18_ADDR_PINS: FirmwareVersion = FirmwareVersion::new(0, 6, 3, 0);
+
+/// Per-slot RAM budget: only one slot is served at a time, so this is
+/// the maximum size of any single slot's ROM table (`build_rom_image`'s
+/// return value).
+pub const MAX_IMAGE_SIZE: usize = 512 * 1024;
 
 /// How to handle Chip images that are too small for the Chip type
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -124,19 +129,6 @@ impl core::fmt::Display for CsLogic {
     }
 }
 
-/// Location within a larger Chip image that the specific image to use resides
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub struct Location {
-    /// Start of the image within the larger Chip image
-    pub start: usize,
-
-    /// Length of the image within the larger Chip image.  Must match the
-    /// selected Chip type, or SizeHandling will be applied.
-    pub length: usize,
-}
-
 impl CsLogic {
     pub fn try_from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
@@ -164,10 +156,53 @@ impl CsLogic {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Number of a chip type's top address lines that cannot fit in the ROM
+/// table, and must therefore act as a half-select instead.
+///
+/// Mirrors the in-range/excess split `derive_addr_layout` performs. The
+/// result is independent of bit mode: `BitMode16` drops one address line
+/// (`A-1`, served by the data PIO rather than the address PIO) but also
+/// halves the usable table depth, so both terms fall by one and cancel:
+///
+/// - `BitMode8`:  `num_addr_lines - log2(MAX_IMAGE_SIZE / 1)`
+/// - `BitMode16`: `(num_addr_lines - 1) - log2(MAX_IMAGE_SIZE / 2)`
+///
+/// `derive_addr_layout` computes the split itself because it also needs the
+/// in-range count and the resolved GPIOs; this is the chip-type-level
+/// question, answerable without a board.
+pub const fn num_excess_addr_lines(chip_type: &ChipType) -> usize {
+    let max_useful_addr_lines = MAX_IMAGE_SIZE.ilog2() as usize;
+    chip_type.num_addr_lines().saturating_sub(max_useful_addr_lines)
+}
+
+/// Whether a chip type's address space exceeds `MAX_IMAGE_SIZE`, so that its
+/// excess top address line(s) act as a half-select selected by `cs1`.
+///
+/// Such a chip has **no `cs1` control line** - here `cs1` names the
+/// half-select, not a pin - yet `cs1` is *required*, so that the user says
+/// which half this One ROM serves. Callers validating `cs1` against
+/// `control_lines()` must special-case it on this basis rather than on the
+/// chip type's name.
+///
+/// The 27C080 is the only such chip type today: two One ROMs each serve half
+/// of its 1MB, one configured `cs1=active_low` (lower 512KB) and the other
+/// `cs1=active_high` (upper 512KB), with A19 as the discriminator.
+pub const fn requires_half_select_cs1(chip_type: &ChipType) -> bool {
+    num_excess_addr_lines(chip_type) > 0
+}
+
+/// Chip select / chip enable configuration for a single Chip.
+///
+/// `ChipSelect` is used for 23-series and other chips with configurable CS
+/// lines.  `CeOe` is used for 27-series and similar chips where both /CE and
+/// /OE are fixed active-low with no user override (V1 behaviour, and V2 single
+/// chips where no override is needed).  `CeOeExplicit` is used in V2 multi-ROM
+/// sets where one of /CE or /OE is fly-leaded to an X pin (active chip select)
+/// and the other is tied active (Ignore).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum CsConfig {
-    /// Configuration of the 3 possible Chip Select lines
+    /// Configuration of the 4 possible Chip Select lines
     ChipSelect {
         /// Where type is ChipSelect, CS1 is always required
         cs1: CsLogic,
@@ -177,39 +212,187 @@ pub enum CsConfig {
 
         /// Third chip select line, required for certain Chip Types
         cs3: Option<CsLogic>,
+
+        /// Fourth chip select line, required for certain Chip Types
+        /// (e.g. HM7641).  Defaulted for backwards compatibility with
+        /// `Chip`s serialized before CS4 existed.
+        #[serde(default)]
+        cs4: Option<CsLogic>,
     },
-    /// Configuration using CE/OE instead of chip select
+    /// Configuration using CE/OE instead of chip select, both fixed
+    /// active-low with no user override.
+    /// cs1_logic() returns ActiveLow (CE); cs2_logic() returns ActiveLow (OE).
     CeOe,
+    /// Configuration using CE/OE with explicit per-line logic values.
+    /// Used in V2 multi-ROM sets where one line is fly-leaded to an X pin
+    /// and the other is tied active (Ignore).
+    ///
+    /// cs1_logic() returns the non-Ignore line (the active chip select).
+    /// cs2_logic() returns the other line (Ignore for multi-ROM secondary
+    /// chips, or ActiveLow when both lines are monitored).
+    CeOeExplicit { ce: CsLogic, oe: CsLogic },
 }
 
 impl CsConfig {
-    pub fn new(cs1: Option<CsLogic>, cs2: Option<CsLogic>, cs3: Option<CsLogic>) -> Self {
-        if cs1.is_none() && cs2.is_none() && cs3.is_none() {
+    /// Construct from configurable CS lines (cs1/cs2/cs3/cs4).
+    /// When all four are None, falls back to CeOe (CE/OE chip with no
+    /// override).
+    ///
+    /// Prefer [`CsConfig::from_chip_type`], which resolves fixed-polarity CS
+    /// lines from the chip type rather than relying on the caller. This
+    /// constructor cannot tell a CE/OE chip from a chip whose CS lines are all
+    /// fixed (and so never specified by the user), and will return `CeOe` for
+    /// both.
+    pub fn new(
+        cs1: Option<CsLogic>,
+        cs2: Option<CsLogic>,
+        cs3: Option<CsLogic>,
+        cs4: Option<CsLogic>,
+    ) -> Self {
+        if cs1.is_none() && cs2.is_none() && cs3.is_none() && cs4.is_none() {
             Self::CeOe
         } else {
             let cs1 = cs1.expect("CS1 must be specified if any CS lines are used");
-            Self::ChipSelect { cs1, cs2, cs3 }
+            Self::ChipSelect { cs1, cs2, cs3, cs4 }
         }
     }
 
-    pub fn cs1_logic(&self) -> CsLogic {
+    /// Construct from a chip type and the user's control line configuration.
+    ///
+    /// A CS line's polarity may be mask-programmed at manufacture
+    /// (`Configurable`), in which case the user supplies it; or fixed by the
+    /// silicon (`FixedActiveLow`/`FixedActiveHigh`, e.g. the HM7641), in which
+    /// case it is read from the chip type and the user may only say
+    /// `CsLogic::Ignore` - "this One ROM does not monitor this line", which is
+    /// participation, not polarity. `check_cs_v2` rejects any attempt to state
+    /// the polarity of a fixed line.
+    ///
+    /// A chip type with no CS lines at all is a CE/OE chip, and falls through
+    /// to [`CsConfig::new_with_ce_oe`].
+    ///
+    /// `ce`/`oe` take precedence over the CS lines when either is specified,
+    /// preserving existing behaviour for chip types that declare both
+    /// (`allow_mixed_control`, currently only the 23C1001).
+    pub fn from_chip_type(
+        chip_type: &ChipType,
+        cs1: Option<CsLogic>,
+        cs2: Option<CsLogic>,
+        cs3: Option<CsLogic>,
+        cs4: Option<CsLogic>,
+        ce: Option<CsLogic>,
+        oe: Option<CsLogic>,
+    ) -> Self {
+        if ce.is_some() || oe.is_some() {
+            return Self::new_with_ce_oe(ce, oe);
+        }
+
+        // Resolve one CS line against the chip type:
+        // - fixed polarity: the silicon decides, unless the user said Ignore
+        // - configurable: the user decides
+        // - no such line on this chip: pass the user's value through. The
+        //   27C080 relies on this - its cs1 is the A19 excess-address
+        //   half-select, not a control line on the chip.
+        let resolve = |name: &str, user: Option<CsLogic>| -> Option<CsLogic> {
+            match chip_type.control_lines().iter().find(|l| l.name == name) {
+                Some(spec) => match spec.line_type.fixed_active_level() {
+                    Some(active_high) => Some(match user {
+                        Some(CsLogic::Ignore) => CsLogic::Ignore,
+                        _ => {
+                            if active_high {
+                                CsLogic::ActiveHigh
+                            } else {
+                                CsLogic::ActiveLow
+                            }
+                        }
+                    }),
+                    None => user,
+                },
+                None => user,
+            }
+        };
+
+        Self::new(
+            resolve("cs1", cs1),
+            resolve("cs2", cs2),
+            resolve("cs3", cs3),
+            resolve("cs4", cs4),
+        )
+    }
+
+    /// Construct from explicit CE/OE logic values.  Used for V2 CE/OE chips
+    /// where one line is set to Ignore in the config (fly-leaded to X pin in
+    /// a multi-ROM set).  Falls back to CeOe when both values are default
+    /// active-low, to preserve V1 compatibility.
+    pub fn new_with_ce_oe(ce: Option<CsLogic>, oe: Option<CsLogic>) -> Self {
+        let ce = ce.unwrap_or(CsLogic::ActiveLow);
+        let oe = oe.unwrap_or(CsLogic::ActiveLow);
+        if ce == CsLogic::ActiveLow && oe == CsLogic::ActiveLow {
+            Self::CeOe
+        } else {
+            Self::CeOeExplicit { ce, oe }
+        }
+    }
+
+    /// Returns the primary chip-select logic.
+    ///
+    /// For ChipSelect: cs1.
+    /// For CeOe: ActiveLow (both lines active, CE treated as primary).
+    /// For CeOeExplicit: the non-Ignore line (CE if CE != Ignore, else OE).
+    pub fn cs1_logic(&self) -> Option<CsLogic> {
         match self {
-            CsConfig::ChipSelect { cs1, .. } => *cs1,
-            CsConfig::CeOe => CsLogic::ActiveLow,
+            CsConfig::ChipSelect { cs1, .. } => Some(*cs1),
+            CsConfig::CeOe => Some(CsLogic::ActiveLow),
+            CsConfig::CeOeExplicit { ce, oe } => {
+                if *ce != CsLogic::Ignore {
+                    Some(*ce)
+                } else {
+                    Some(*oe)
+                }
+            }
         }
     }
 
+    /// Returns the secondary chip-select logic.
+    ///
+    /// For ChipSelect: cs2.
+    /// For CeOe: ActiveLow (OE is also active).
+    /// For CeOeExplicit: the complementary line to cs1 — should be Ignore
+    /// for multi-ROM secondary chips.
     pub fn cs2_logic(&self) -> Option<CsLogic> {
         match self {
             CsConfig::ChipSelect { cs2, .. } => *cs2,
             CsConfig::CeOe => Some(CsLogic::ActiveLow),
+            CsConfig::CeOeExplicit { ce, oe } => {
+                if *ce != CsLogic::Ignore {
+                    Some(*oe)
+                } else {
+                    Some(*ce)
+                }
+            }
         }
     }
 
+    /// Returns the tertiary chip-select logic.
+    ///
+    /// Only meaningful for ChipSelect chips with three or more CS lines.
+    /// Not applicable to CE/OE chips.
     pub fn cs3_logic(&self) -> Option<CsLogic> {
         match self {
             CsConfig::ChipSelect { cs3, .. } => *cs3,
             CsConfig::CeOe => None,
+            CsConfig::CeOeExplicit { .. } => None,
+        }
+    }
+
+    /// Returns the quaternary chip-select logic.
+    ///
+    /// Only meaningful for ChipSelect chips with four CS lines (e.g. the
+    /// HM7641). Not applicable to CE/OE chips.
+    pub fn cs4_logic(&self) -> Option<CsLogic> {
+        match self {
+            CsConfig::ChipSelect { cs4, .. } => *cs4,
+            CsConfig::CeOe => None,
+            CsConfig::CeOeExplicit { .. } => None,
         }
     }
 }
@@ -279,6 +462,10 @@ impl Chip {
 
     pub fn has_data(&self) -> bool {
         self.data.is_some()
+    }
+
+    pub fn data(&self) -> Option<&[u8]> {
+        self.data.as_deref()
     }
 
     /// Returns a [`Chip`] instance.
@@ -496,7 +683,7 @@ impl Chip {
     //
     // This transformation ensures that when the hardware reads a byte through its
     // data pins, it gets the correct bit values despite the non-standard connections.
-    fn byte_mangled(byte: u8, board: &Board) -> u8 {
+    pub(crate) fn byte_mangled(byte: u8, board: &Board) -> u8 {
         // Start with 0 result
         let mut result = 0;
 
@@ -638,12 +825,13 @@ impl Chip {
             ChipType::Chip23QL384 => 31,
             ChipType::Chip23C1001 => 32,
             ChipType::Chip27C200 => 33,
+            _ => panic!("Unsupported Chip type for pre-V0.7.0 firmware {:?}", self.chip_type),
         }
     }
 }
 
 /// Type of Chip set
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ChipSetType {
@@ -691,7 +879,7 @@ impl ChipSet {
         set_type: ChipSetType,
         serve_alg: ServeAlg,
         chips: Vec<Chip>,
-        firmware_overrides: Option<crate::builder::FirmwareConfig>,
+        firmware_overrides: Option<crate::FirmwareConfig>,
     ) -> Result<Self> {
         // Check some Chips were supplied
         if chips.is_empty() {
@@ -780,17 +968,22 @@ impl ChipSet {
             for chip in &self.chips {
                 if chip.cs_config.cs1_logic() != first_cs1 {
                     return Err(Error::InconsistentCsLogic {
-                        first: first_cs1,
-                        other: chip.cs_config.cs1_logic(),
+                        first: first_cs1.unwrap(),
+                        other: chip.cs_config.cs1_logic().unwrap(),
                     });
                 }
             }
 
             // For multi-Chip sets we also need to check CS2 and CS3 are ignored
-            // for all Chips
+            // for all Chips.  CE/OE chips (plain CeOe) are skipped here — they
+            // have no cs2/cs3 select concept and their secondary line is handled
+            // via CeOeExplicit when an explicit override is configured.
             #[allow(clippy::collapsible_if)]
             if self.set_type == ChipSetType::Multi {
                 for chip in &self.chips {
+                    if matches!(chip.cs_config, CsConfig::CeOe) {
+                        continue;
+                    }
                     if let Some(cs2) = chip.cs_config.cs2_logic() {
                         if cs2 != CsLogic::Ignore {
                             return Err(Error::InconsistentCsLogic {
@@ -810,7 +1003,7 @@ impl ChipSet {
                 }
             }
 
-            Ok(self.chips[0].cs_config.cs1_logic())
+            Ok(self.chips[0].cs_config.cs1_logic().unwrap())
         }
     }
 
@@ -866,9 +1059,7 @@ impl ChipSet {
                     // the same image size.
                     assert!(num_addr_pins == 18);
                     match chip.chip_type() {
-                        ChipType::Chip2364 | ChipType::Chip231024 => {
-                            2_usize.pow(18)
-                        } // 256KB
+                        ChipType::Chip2364 | ChipType::Chip231024 => 2_usize.pow(18), // 256KB
                         ChipType::Chip23QL384 | ChipType::Chip23QL512 => {
                             // /CE is used as A15 for these chips.  On the fire-28-c,
                             // /CE is before /OE, hence requires 18 bits
@@ -1016,7 +1207,8 @@ impl ChipSet {
             // All of CS1/X1/X2 have to have the same active low/high status
             // so we retrieve that from CS1 (as X1/X2 aren't specifically
             // configured in the chip sets).
-            let pins_active_high = chip_in_set.cs_config.cs1_logic() == CsLogic::ActiveHigh;
+            let pins_active_high =
+                chip_in_set.cs_config.cs1_logic().unwrap() == CsLogic::ActiveHigh;
 
             // Get the CS pin that controls this chip's selection
             let cs_pin = board.cs_bit_for_chip_in_set(chip_in_set.chip_type, index);
@@ -1080,6 +1272,12 @@ impl ChipSet {
     ) -> bool {
         let cs_config = &chip_in_set.cs_config;
         let chip_type = chip_in_set.chip_type;
+
+        // CE/OE chips don't have cs2/cs3 selects — no additional requirements
+        // to check beyond the primary CS which is already verified by the caller.
+        if matches!(cs_config, CsConfig::CeOe | CsConfig::CeOeExplicit { .. }) {
+            return true;
+        }
 
         // Check CS2 if specified
         if let Some(cs2_logic) = cs_config.cs2_logic() {
@@ -1243,7 +1441,7 @@ impl ChipSet {
             buf[offset] = if is_plugin {
                 CsLogic::Ignore.c_enum_val()
             } else {
-                chip.cs_config.cs1_logic().c_enum_val()
+                chip.cs_config.cs1_logic().unwrap().c_enum_val()
             };
             offset += 1;
             buf[offset] = if is_plugin {
@@ -1521,7 +1719,7 @@ fn handle_snowflake_chip_types(
                             a16_index
                         );
                     }
-                },
+                }
                 Board::Fire32B => {
                     if a16_index == 2 {
                         // Remove two entries of pin map
@@ -1572,7 +1770,7 @@ fn handle_snowflake_chip_types(
         if !matches!(board, Board::Fire32B) {
             panic!("SST39SF040 is not supported on fire-32-a - use 27C040 with a shim");
         }
-        
+
         // On fire-32-b, regular A18 is the first address pin.  Remove it
         modified_map.remove(0);
 

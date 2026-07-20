@@ -5,6 +5,7 @@
 // One ROM user plugin: NeoPixel smooth colour cycle
 
 #include "plugin.h"
+#include "onerom_metadata.h"
 
 ORA_DEFINE_USER_PLUGIN(
     neopixel_main,

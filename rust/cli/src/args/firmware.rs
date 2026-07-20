@@ -234,15 +234,43 @@ pub struct FirmwareBuildArgs {
     #[arg(long, short)]
     pub force: bool,
 
+    /// Allow a --slot chip type that is not in the target board's supported set.
+    ///
+    /// Bypasses only the supported-chip-type check. Board electrical
+    /// constraints (e.g. the 40-pin requirement for force_16bit) still apply.
+    #[arg(long, visible_alias = "allow-unsupported-chip")]
+    pub allow_unsupported_chip_type: bool,
+
     /// Confirm building a firmware with no ROM configuration.
     ///
     /// Only valid with --config-name and/or --config-description.
     /// Mutually exclusive with --config-file and --slot.
     #[arg(
         long,
-        conflicts_with_all = ["config_file", "slot"]
+        conflicts_with_all = ["config_file", "slot", "instance_name", "serial_override", "logging", "disable_swd", "turbo_boot"]
     )]
     pub no_config: bool,
+
+    /// Provide this One ROM with a name
+    #[arg(long, visible_aliases = ["instance-name", "instance_name", "onerom", "onerom-name", "one-rom", "one-rom-name"], value_name = "NAME", conflicts_with_all = ["no_config"])]
+    pub instance_name: Option<String>,
+
+    // Provide a serial number to override this device's actual serial number
+    #[arg(long, visible_aliases = ["serial-override", "serial_override"], value_name = "NEW SERIAL", conflicts_with_all = ["no_config"])]
+    pub serial_override: Option<String>,
+
+    /// Enable logging on this One ROM firmware
+    #[arg(long, visible_aliases = ["boot-logging", "boot_logging"], default_missing_value = "true", num_args = 0..=1, conflicts_with_all = ["no_config"])]
+    pub logging: Option<bool>,
+
+    /// Disable SWD debugging on this One ROM firmware
+    #[arg(long, visible_aliases = ["swd-disable", "swd_disabled"], default_missing_value = "true", num_args = 0..=1, conflicts_with_all = ["no_config"])]
+    pub disable_swd: Option<bool>,
+
+    /// Enable turbo boot - starts ROM serving faster, but only supports a
+    /// single programmed slot
+    #[arg(long, visible_aliases = ["turbo-boot", "turbo_boot"], default_missing_value = "true", num_args = 0..=1, conflicts_with_all = ["no_config"])]
+    pub turbo_boot: Option<bool>,
 }
 
 impl CommandTrait for FirmwareBuildArgs {
