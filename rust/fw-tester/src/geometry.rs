@@ -19,6 +19,12 @@
 //! former additionally uses [`slot_geometry`] for the forced-low gap check, and
 //! [`expected_rom_slot_size`] is the thin region-size caller the RAM-slot tests
 //! use.
+//!
+//! Running that gen build needs `onerom-fw` to fetch the ROM files, which does
+//! not compile for wasm, so this module stays here rather than joining the pure
+//! geometry in `onerom-fw-geometry`.  [`chip_substitution`] does live there —
+//! it is pure — and is re-exported below so `geometry::chip_substitution` still
+//! resolves.
 
 use std::path::Path;
 
@@ -30,6 +36,8 @@ use onerom_metadata::{
     DeviceMemoryView, GpioOverride, METADATA_BASE, OneromAlgAddrConfig, OneromMetadataHeader,
     RomSlotType,
 };
+
+pub use onerom_fw_geometry::substitution::chip_substitution;
 
 /// `GpioOverLow` discriminant (top two bits of an override-config byte).
 const OVERRIDE_LOW: u8 = GpioOverride::GpioOverLow as u8;

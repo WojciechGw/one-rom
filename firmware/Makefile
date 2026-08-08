@@ -13,11 +13,20 @@ BUILD_DIR := build
 # This directory
 FIRMWARE_DIR := firmware
 
+# Version of apio to build against.  Remove the apio/ directory after changing
+# this, so it is re-cloned.
+APIO_VERSION ?= v0.2.0
+
 OBJCOPY_EXTRA = --set-section-flags .metadata=contents,readonly -R .metadata -R .rom_data -R .padding_to_rom_data
 $(info - $(COLOUR_YELLOW)Excluding metadata and ROM images from binary$(COLOUR_RESET))
 
 # Toolchain
-TOOLCHAIN ?= /opt/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi/bin
+#
+# The version is pinned in ci/arm-toolchain-version, and ci/install-arm-toolchain.sh
+# installs it and creates this version-less symlink, so CI, the build container
+# and a developer's machine all compile the firmware with the same compiler.
+# Set TOOLCHAIN to override - the installer prints the directory to use.
+TOOLCHAIN ?= /opt/arm-toolchain/bin
 CC := $(TOOLCHAIN)/arm-none-eabi-gcc
 OBJDUMP := $(TOOLCHAIN)/arm-none-eabi-objdump
 OBJCOPY := $(TOOLCHAIN)/arm-none-eabi-objcopy
@@ -83,7 +92,7 @@ segger-rtt:
 
 apio:
 	@if [ ! -d "$@" ]; then \
-		git clone https://github.com/piersfinlayson/apio.git; \
+		git -c advice.detachedHead=false clone --quiet --depth 1 --branch $(APIO_VERSION) https://github.com/piersfinlayson/apio.git; \
 	fi
 
 # sdrr object files

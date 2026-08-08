@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 
 use onerom_config::chip::{CHIP_TYPE_NAMES, ChipType};
 use onerom_config::hw::{Board, Model};
-use onerom_gen::compat::{CompatResult, check_chip_on_board, is_v2_chip};
+use onerom_gen::ChipSetType;
+use onerom_gen::compat::{
+    ChipCompat, CompatResult, check_chip_set_on_board, default_cs_config, format_size, is_v2_chip,
+    pin_offset_order, supported_chips,
+};
 
 // ── Repository paths ──────────────────────────────────────────────────────────
 
@@ -100,16 +104,6 @@ fn board_short(board: Board) -> String {
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
-fn format_size(bytes: u32) -> String {
-    if bytes >= 1024 * 1024 {
-        format!("{}MB", bytes / (1024 * 1024))
-    } else if bytes >= 1024 {
-        format!("{}KB", bytes / 1024)
-    } else {
-        format!("{}B", bytes)
-    }
-}
-
 /// Format a compat result as a Markdown table cell.
 ///
 /// `-` = not supported; `64KB` = native fit; `64KB*` = One ROM overhangs
@@ -130,36 +124,6 @@ fn format_result(result: &Option<CompatResult>) -> String {
     }
 }
 
-/// Human-readable socket fit description for per-board tables.
-fn format_socket(result: &CompatResult) -> String {
-    if result.is_native() {
-        "native".to_string()
-    } else if result.requires_fly_leads() {
-        match result.num_fly_lead_pins {
-            0 => "no fly-leads required".to_string(),
-            1 => "fly-lead to X1".to_string(),
-            2 => "fly-lead to X1 and X2".to_string(),
-            n => format!("fly-lead ({} pins)", n),
-        }
-    } else {
-        "overhang".to_string()
-    }
-}
-
-// ── Sort key ──────────────────────────────────────────────────────────────────
-
-/// Sort key for entries: native first, then overhang (ascending by chip size
-/// difference), then fly-lead (ascending by chip size difference).
-fn pin_offset_order(pin_offset: i16) -> i32 {
-    if pin_offset == 0 {
-        0
-    } else if pin_offset > 0 {
-        1
-    } else {
-        2
-    }
-}
-
 // ── Data structures ───────────────────────────────────────────────────────────
 
 /// One chip row in the compatibility matrix.
@@ -176,19 +140,11 @@ struct MatrixGroup {
     entries: Vec<MatrixEntry>,
 }
 
-/// One supported chip in a per-board table.
-struct BoardEntry {
-    alias: &'static str,
-    rom_size: u32,
-    chip_pins: u8,
-    result: CompatResult,
-}
-
 /// A group of same-offset chips in a per-board table.
 struct BoardGroup {
     pin_offset: i16,
     chip_pins: u8,
-    entries: Vec<BoardEntry>,
+    entries: Vec<ChipCompat>,
 }
 
 // ── Matrix section ────────────────────────────────────────────────────────────
@@ -212,7 +168,16 @@ fn write_matrix_section(w: &mut impl Write, title: &str, boards: &[Board]) -> io
             }
             let results: Vec<Option<CompatResult>> = boards
                 .iter()
-                .map(|b| check_chip_on_board(*b, chip_type))
+                .map(|b| {
+                    check_chip_set_on_board(
+                        *b,
+                        chip_type,
+                        ChipSetType::Single,
+                        1,
+                        default_cs_config(chip_type),
+                    )
+                    .ok()
+                })
                 .collect();
             if results.iter().all(|r| r.is_none()) {
                 return None;
@@ -296,19 +261,7 @@ fn write_board_table(w: &mut impl Write, board: Board) -> io::Result<()> {
     writeln!(w, "## {} — {}", board.description(), board.name())?;
     writeln!(w)?;
 
-    let mut entries: Vec<BoardEntry> = CHIP_TYPE_NAMES
-        .iter()
-        .filter_map(|alias| {
-            let chip_type = ChipType::try_from_str(alias)?;
-            let result = check_chip_on_board(board, chip_type)?;
-            Some(BoardEntry {
-                alias,
-                rom_size: chip_type.size_bytes() as u32,
-                chip_pins: chip_type.chip_pins(),
-                result,
-            })
-        })
-        .collect();
+    let entries = supported_chips(board, ChipSetType::Single, 1);
 
     if entries.is_empty() {
         writeln!(w, "*(no supported chips)*")?;
@@ -316,22 +269,13 @@ fn write_board_table(w: &mut impl Write, board: Board) -> io::Result<()> {
         return Ok(());
     }
 
-    entries.sort_by_key(|e| {
-        (
-            pin_offset_order(e.result.pin_offset),
-            e.result.pin_offset.abs(),
-            e.rom_size,
-            e.alias,
-        )
-    });
-
     let mut groups: Vec<BoardGroup> = Vec::new();
     for entry in entries {
         match groups.last_mut() {
             Some(g) if g.pin_offset == entry.result.pin_offset => g.entries.push(entry),
             _ => groups.push(BoardGroup {
                 pin_offset: entry.result.pin_offset,
-                chip_pins: entry.chip_pins,
+                chip_pins: entry.chip_type.chip_pins(),
                 entries: vec![entry],
             }),
         }
@@ -359,9 +303,9 @@ fn write_board_table(w: &mut impl Write, board: Board) -> io::Result<()> {
                 w,
                 "| {} | {} | {} | {} |",
                 entry.alias,
-                format_size(entry.rom_size),
+                format_size(entry.rom_size_bytes),
                 format_size(entry.result.slot_size_bytes),
-                format_socket(&entry.result),
+                entry.result.fit_description(),
             )?;
         }
         writeln!(w)?;
@@ -447,6 +391,16 @@ fn generate_document(w: &mut impl Write) -> io::Result<()> {
                  socket pins to the X1 (and, if two are needed, X2) header pin on One ROM."
     )?;
     writeln!(w)?;
+    writeln!(
+        w,
+        "**Every image size below assumes One ROM monitors all of the chip's control \
+                 lines** — every chip select, or /CE and /OE — which is what the tools \
+                 produce unless told otherwise. A chip that One ROM can only serve with one \
+                 of those lines left unmonitored is shown as unsupported here, because \
+                 doing that requires the `allow_cs_ignore` config option and cannot be \
+                 expressed on the `onerom` command line at all."
+    )?;
+    writeln!(w)?;
     writeln!(w, "| Cell | Meaning |")?;
     writeln!(w, "|:---|:---|")?;
     writeln!(
@@ -478,6 +432,39 @@ fn generate_document(w: &mut impl Write) -> io::Result<()> {
         "Full chip list for each board. Where a particular ROM type goes \
                  by multiple identifiers (for example 27512, 27C512, 27SF512), each \
                  type appears as a separate row."
+    )?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "The **Fit** column says how the chip sits in the board's socket:"
+    )?;
+    writeln!(w)?;
+    writeln!(w, "| Fit | Meaning |")?;
+    writeln!(w, "|:---|:---|")?;
+    writeln!(
+        w,
+        "| `native` | Chip and board have the same pin count — it goes straight in |"
+    )?;
+    writeln!(
+        w,
+        "| `overhang` | Chip has *fewer* pins than the board, so One ROM's top pins hang out of the socket |"
+    )?;
+    writeln!(
+        w,
+        "| `larger socket (no fly-leads)` | Chip has *more* pins than the board, but no address line among the extra ones: One ROM sits in the bottom of the socket with nothing to wire |"
+    )?;
+    writeln!(
+        w,
+        "| `fly-lead to X1` (and `X2`) | Chip has more pins than the board, and the overhanging address line(s) must be wired to One ROM's X1 (and X2) header pin |"
+    )?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "Every fit other than `native` is a cross-size fit, and in all of them One \
+                 ROM's power pins may not line up with the socket's — power must be \
+                 rerouted to One ROM's own VCC or 5V header pin. \
+                 `larger socket (no fly-leads)` means no *signal* wiring is needed; it \
+                 does not mean the chip simply drops in."
     )?;
     writeln!(w)?;
 

@@ -44,12 +44,10 @@ pub fn build(manifest_path: &Path) {
 
     // Write generated files
     let generated_path = manifest_path.join("src").join(HW_GENERATED_RS_FILENAME);
-    fs::write(&generated_path, &generated_code)
-        .unwrap_or_else(|e| panic!("Failed to write {}: {}", generated_path.display(), e));
+    crate::fmt::write_rust(&generated_path, &generated_code);
 
     let mod_path = manifest_path.join("src").join(HW_MOD_RS_FILENAME);
-    fs::write(&mod_path, &lib_code)
-        .unwrap_or_else(|e| panic!("Failed to write {}: {}", mod_path.display(), e));
+    crate::fmt::write_rust(&mod_path, &lib_code);
 }
 
 fn get_config_dirs(repo_root: &Path) -> Vec<std::path::PathBuf> {
@@ -339,8 +337,10 @@ fn generate_lib_rs(configs: &[HwConfigData]) -> String {
     code.push_str("#![deny(unsafe_code)]\n\n");
 
     code.push_str("mod generated;\n");
+    code.push_str("mod header;\n");
     code.push_str("mod helpers;\n\n");
     code.push_str("pub use generated::*;\n");
+    code.push_str("pub use header::*;\n");
 
     code
 }
@@ -354,10 +354,21 @@ fn generate_rust_code(configs: &[HwConfigData]) -> String {
     code.push_str("// Copyright (C) 2025 Piers Finlayson <piers@piers.rocks>\n");
     code.push_str("//\n");
     code.push_str("// MIT License\n\n");
-    code.push_str("#![allow(dead_code)]\n\n");
+    code.push_str("#![allow(dead_code)]\n");
+    // The generated board tables match exhaustively over generated enums with
+    // a catch-all arm.  The workspace enables clippy::wildcard_enum_match_arm
+    // so that a new variant of a *hand-written* enum is caught; here the
+    // wildcards are emitted deliberately and there is no author to warn, so
+    // the lint is switched off at generation time - in the same spirit as the
+    // rustfmt pass that keeps this file clean for the format gate.
+    code.push_str("#![allow(clippy::wildcard_enum_match_arm)]\n\n");
 
     code.push_str("use crate::chip::{ChipType, chip_type_names_for_pins};\n");
-    code.push_str("use crate::mcu::{Port, Family, RpVariant};\n\n");
+    code.push_str("use crate::mcu::{Port, Family, RpVariant};\n");
+    code.push_str("#[allow(unused_imports)]\n");
+    code.push_str(
+        "use crate::hw::header::{JumperHeader, HeaderColumn, HeaderSlot, HeaderRole};\n\n",
+    );
 
     // Generate models
     code.push_str(&generate_hw_models(configs));
@@ -461,6 +472,9 @@ fn generate_hw_config_impl(configs: &[HwConfigData]) -> String {
     code.push_str("\n\n");
 
     code.push_str(&generate_jumper_methods(configs));
+    code.push_str("\n\n");
+
+    code.push_str(&generate_jumper_header_method(configs));
     code.push_str("\n\n");
 
     code.push_str(&generate_pin_map_methods(configs));
@@ -1115,6 +1129,39 @@ fn generate_jumper_methods(configs: &[HwConfigData]) -> String {
         code.push_str(&format!(
             "            Board::{} => {},\n",
             config.variant_name, config.config.mcu.pins.x_jumper_pull
+        ));
+    }
+
+    code.push_str("        }\n");
+    code.push_str("    }");
+
+    code
+}
+
+fn generate_jumper_header_method(configs: &[HwConfigData]) -> String {
+    let mut code = String::new();
+
+    code.push_str("    /// Get the physical jumper-header descriptor for this board\n");
+    code.push_str("    ///\n");
+    code.push_str("    /// Returns `None` for boards whose header layout has not yet been\n");
+    code.push_str(
+        "    /// characterised, in which case a consumer should fall back to a generic\n",
+    );
+    code.push_str("    /// description rather than drawing an inaccurate wireframe.\n");
+    code.push_str("    pub const fn jumper_header(&self) -> Option<JumperHeader> {\n");
+    code.push_str("        match self {\n");
+
+    for config in configs {
+        let arm = match &config.config.jumper_header {
+            Some(header) => {
+                let cols = validation::parse_jumper_header(&config.name, header);
+                format!("Some({})", validation::format_jumper_header(&cols))
+            }
+            None => "None".to_string(),
+        };
+        code.push_str(&format!(
+            "            Board::{} => {},\n",
+            config.variant_name, arm
         ));
     }
 

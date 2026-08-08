@@ -128,7 +128,10 @@ void ora_log(const char* msg, ...) {
     do_log_v(msg, &args);
     va_end(args);
 #else // TEST_BUILD
-    stub_log(msg);
+    va_list args;
+    va_start(args, msg);
+    stub_log_v(msg, args);
+    va_end(args);
 #endif // !TEST_BUILD
 #else
     (void)msg;
@@ -145,7 +148,10 @@ void ora_err_log(const char* msg, ...) {
     do_log_v(msg, &args);
     va_end(args);
 #else // TEST_BUILD
-    err_log(msg);
+    va_list args;
+    va_start(args, msg);
+    stub_log_prefix_v("ERROR: ", msg, args);
+    va_end(args);
 #endif // !TEST_BUILD
 
 #else
@@ -162,7 +168,10 @@ void ora_debug_log(const char* msg, ...) {
     do_log_v(msg, &args);
     va_end(args);
 #else // TEST_BUILD
-    stub_log("DEBUG:%s", msg);
+    va_list args;
+    va_start(args, msg);
+    stub_log_prefix_v("DEBUG:", msg, args);
+    va_end(args);
 #endif // !TEST_BUILD
 #else
     (void)msg;
@@ -176,7 +185,12 @@ size_t plugin_get_free_mem(void) {
 void ora_set_status_led(uint8_t on) {
 #if !defined(TEST_BUILD)
     uint8_t pin = HW->gpio_status;
-    if (RUNTIME->status_led_enabled && pin <= MAX_GPIOS) {
+    // Pin presence is the only gate: a plugin may drive the status LED even if
+    // it was configured off. status_led_enabled is the live state and plugin
+    // coordination channel (see ora_set_status_led_fn_t in api.h), so record
+    // the new state here as well as driving the pin.
+    if (pin < MAX_GPIOS) {
+        RUNTIME->status_led_enabled = on ? 1 : 0;
         if (on) {
             status_led_on(pin);
         } else {
@@ -281,7 +295,7 @@ uint32_t ora_get_chip_size_from_type(uint32_t chip_type) {
 
 uint8_t ora_is_pin_output(uint8_t pin) {
 #if !defined(TEST_BUILD)
-    if (pin <= MAX_GPIOS) {
+    if (pin < MAX_GPIOS) {
         return GPIO_IS_OUTPUT(pin);
     }
     return 0xFF;
@@ -339,6 +353,18 @@ ora_result_t ora_demangle_addr(
     return pio_demangle_addr(CURRENT_SLOT, physical_addr, logical_addr_out, check_control_pins);
 }
 
+ora_result_t ora_demangle_observed_addr(
+    uint32_t physical_addr,
+    uint32_t *observed_addr_out,
+    uint8_t check_control_pins
+) {
+    return pio_demangle_observed_addr(CURRENT_SLOT, physical_addr, observed_addr_out, check_control_pins);
+}
+
+ora_result_t ora_get_unobserved_addr_bits(uint8_t *bits_out) {
+    return pio_get_unobserved_addr_bits(CURRENT_SLOT, bits_out);
+}
+
 ora_result_t ora_init_knock(
     const uint32_t *knock_seq,
     uint8_t knock_len,
@@ -389,18 +415,40 @@ volatile uint32_t * volatile *ora_get_address_monitor_ring_write_pos(void) {
     return pio_get_address_monitor_ring_write_pos();
 }
 
-uint8_t ora_get_ram_slot_count(void) {
-    uint8_t effective_addr_pins = pio_get_effective_addr_pins();
+// The region the RAM slots are carved out of, from the linker script.
+extern uint32_t _ram_rom_image_start[];
+extern uint32_t _ram_rom_image_end[];
 
-    // Slot count based on ROM size:
-    // - 2^16=64KB=7
-    // - 2^17=128KB=3
-    // - 2^18=256KB=2
-    // - 2^19+=512KB=1
-    if (effective_addr_pins <= 16) return 7;
-    if (effective_addr_pins <= 17) return 3;
-    if (effective_addr_pins <= 18) return 2;
-    return 1;
+// Bytes available for RAM slots.
+static uint32_t ram_rom_image_size(void) {
+#if defined(TEST_BUILD)
+    // The native test build has no linker script; its stub reserves the same
+    // region as a fixed-size object.
+    return RAM_ROM_TABLE_SIZE;
+#else
+    return (uint32_t)((uintptr_t)_ram_rom_image_end
+                      - (uintptr_t)_ram_rom_image_start);
+#endif
+}
+
+uint8_t ora_get_ram_slot_count(void) {
+    uint32_t region_size = pio_get_rom_region_size();
+    if (region_size == 0u) {
+        return 1u;
+    }
+
+    // As many as the region holds.  Previously this was a table keyed on the
+    // ROM size, capped at 7 so that a slot would be at least 64KB; but a slot
+    // has to be exactly one ROM region — that is what makes it servable — so
+    // the cap only ever threw away slots that a small ROM would have had.
+    uint32_t count = ram_rom_image_size() / region_size;
+    if (count < 1u) {
+        return 1u;
+    }
+    if (count > ORA_MAX_RAM_SLOTS) {
+        count = ORA_MAX_RAM_SLOTS;
+    }
+    return (uint8_t)count;
 }
 
 ora_result_t ora_get_ram_slot_info(
@@ -545,10 +593,38 @@ ora_result_t ora_get_flash_slot_info(
     return ORA_RESULT_OK;
 }
 
-ora_result_t ora_get_flash_slot_ext_info(uint8_t flash_slot, uint32_t flags) {
-    (void)flash_slot;
-    (void)flags;
-    return ORA_RESULT_ERROR;
+ora_result_t ora_get_flash_slot_ext_info(
+    uint8_t flash_slot,
+    uint8_t rom_index,
+    uint32_t flags,
+    const char **rom_type_out,
+    const char **filename_out,
+    uint32_t *chip_size_out,
+    uint32_t *rbcp_rom_type_out
+) {
+    const onerom_rom_slot_t *set = get_flash_slot_slot(flash_slot, flags);
+    if (set == NULL) {
+        return ORA_RESULT_INVALID_SLOT;
+    }
+    if (rom_index >= set->rom_count) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    const onerom_rom_info_t *rom = set->roms[rom_index];
+    if (rom_type_out != NULL) {
+        *rom_type_out = rom->rom_type;
+    }
+    if (filename_out != NULL) {
+        *filename_out = rom->filename;
+    }
+    if (chip_size_out != NULL) {
+        *chip_size_out = rom->chip_size;
+    }
+    if (rbcp_rom_type_out != NULL) {
+        *rbcp_rom_type_out = (uint32_t)rom->rbcp_rom_type;
+    }
+
+    return ORA_RESULT_OK;
 }
 
 ora_result_t ora_copy_flash_slot_to_ram_slot(
@@ -597,6 +673,41 @@ ora_result_t ora_get_device_version(uint8_t *version_out, uint32_t max_len) {
     }
     memcpy(version_out, version_str, version_str_len);
     return ORA_RESULT_OK;
+}
+
+ora_result_t ora_get_metadata_str(ora_metadata_key_t key, const char **out) {
+    if (out == NULL) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    // The per-key arms are generated from the schema `plugin_key` fields and
+    // expanded from ONEROM_METADATA_STR_CASES (onerom_metadata.h). A string key
+    // resolves its stored value verbatim - NULL when the optional field is
+    // unset, returned as OK, not an error, and no serial policy is applied. Any
+    // non-string key returns ORA_RESULT_TYPE_MISMATCH. Keys unknown to this
+    // firmware fall through to the default below.
+    switch (key) {
+        ONEROM_METADATA_STR_CASES(out)
+        default:
+            return ORA_RESULT_NOT_SUPPORTED;
+    }
+}
+
+ora_result_t ora_get_metadata_uint(ora_metadata_key_t key, uint32_t *out) {
+    if (out == NULL) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    // The per-key arms are generated from the schema `plugin_key` fields and
+    // expanded from ONEROM_METADATA_UINT_CASES (onerom_metadata.h). An unsigned
+    // scalar/enum key resolves its stored value zero-extended to uint32_t; any
+    // non-numeric key returns ORA_RESULT_TYPE_MISMATCH. Keys unknown to this
+    // firmware fall through to the default below.
+    switch (key) {
+        ONEROM_METADATA_UINT_CASES(out)
+        default:
+            return ORA_RESULT_NOT_SUPPORTED;
+    }
 }
 
 ora_result_t ora_demangle_data(uint8_t physical_data, uint8_t *logical_data_out) {
@@ -809,6 +920,122 @@ ora_result_t ora_read_ram_rom_slot(
     return pio_read_ram_rom_slot(CURRENT_SLOT, slot, offset, buf, len);
 }
 
+// Returns what One ROM is using gpio for, as an ora_gpio_use_t.  gpio must
+// already have been range checked.
+//
+// The serving set of the active slot comes from pio_get_gpio_use(), which
+// derives it from the configuration the serving path itself acts on.  Board
+// system pins are checked afterwards, so a pin doing both is reported as what
+// serving is using it for.  Deliberately excluded: the image select pads, whose
+// primary use for GPIO control is a wire soldered to a pad whose jumper has been
+// removed, and SWCLK/SWDIO, which are not GPIOs on the boards that expose them.
+static uint8_t ora_gpio_get_use(uint8_t gpio) {
+    uint8_t use = ORA_GPIO_USE_FREE;
+
+    const onerom_rom_slot_t *slot = CURRENT_SLOT;
+    if (slot != NULL) {
+        if (pio_get_gpio_use(slot, gpio, &use) != ORA_RESULT_OK) {
+            use = ORA_GPIO_USE_FREE;
+        }
+        if (use != ORA_GPIO_USE_FREE) {
+            return use;
+        }
+    }
+
+    // System pins.  Each is GPIO_NONE when the board does not have it, and gpio
+    // is known to be less than MAX_GPIOS, so a direct comparison cannot match a
+    // missing pin.
+    if (gpio == HW->gpio_status ||
+        gpio == HW->gpio_neopixel ||
+        gpio == HW->gpio_vbus ||
+        gpio == HW->gpio_ext_flash_cs) {
+        return ORA_GPIO_USE_SYSTEM;
+    }
+
+    return ORA_GPIO_USE_FREE;
+}
+
+ora_result_t ora_gpio_set(uint8_t gpio, uint8_t state, uint32_t flags) {
+    if (gpio >= MAX_GPIOS) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+    if (state != ORA_GPIO_STATE_LOW &&
+        state != ORA_GPIO_STATE_HIGH &&
+        state != ORA_GPIO_STATE_INPUT) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    if (!(flags & ORA_GPIO_FLAG_FORCE) &&
+        (ora_gpio_get_use(gpio) != ORA_GPIO_USE_FREE)) {
+        return ORA_RESULT_GPIO_IN_USE;
+    }
+
+#if !defined(TEST_BUILD)
+    // Only the function select, the output enables and the pad's output-disable
+    // bit are touched.  Pulls, drive strength, slew and the input override are
+    // left as they are, so on an ORA_GPIO_USE_SERVING_READ pin - all of which
+    // serving leaves as SIO inputs - releasing back to ORA_GPIO_STATE_INPUT
+    // restores exactly the configuration serving set up, including any polarity
+    // inversion the select lines rely on.
+    if (state == ORA_GPIO_STATE_INPUT) {
+        // Disable the pad's output driver first: that stops the pin driving
+        // whatever peripheral currently owns it.
+        GPIO_PAD(gpio) |= (PAD_OUTPUT_DISABLE | PAD_INPUT);
+        SIO_GPIO_OE_CLR_PIN(gpio);
+        GPIO_CTRL(gpio) = (GPIO_CTRL(gpio) & ~(uint32_t)GPIO_CTRL_FUNC_MASK) |
+                          GPIO_CTRL_FUNC_SIO;
+    } else {
+        // Set the output value before enabling the driver, so the pin never
+        // momentarily drives the wrong level.
+        if (state == ORA_GPIO_STATE_HIGH) {
+            SIO_GPIO_OUT_SET_PIN(gpio);
+        } else {
+            SIO_GPIO_OUT_CLR_PIN(gpio);
+        }
+        GPIO_CTRL(gpio) = (GPIO_CTRL(gpio) & ~(uint32_t)GPIO_CTRL_FUNC_MASK) |
+                          GPIO_CTRL_FUNC_SIO;
+        GPIO_PAD(gpio) &= ~(PAD_OUTPUT_DISABLE | (1u << PAD_ISO_BIT));
+        GPIO_PAD(gpio) |= PAD_INPUT;
+        SIO_GPIO_OE_SET_PIN(gpio);
+    }
+#else // TEST_BUILD
+    LOG("ORA gpio set %d state %d flags 0x%08x", gpio, state, flags);
+#endif // !TEST_BUILD
+
+    return ORA_RESULT_OK;
+}
+
+ora_result_t ora_gpio_query(uint8_t gpio, ora_gpio_info_t *info_out) {
+    if (info_out == NULL || gpio >= MAX_GPIOS) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    // The caller tells us how large its own copy of the structure is; we write
+    // no more than that, and report back how much we wrote.
+    uint8_t caller_size = info_out->size;
+    if (caller_size == 0) {
+        return ORA_RESULT_INVALID_SIZE;
+    }
+    if (caller_size > sizeof(ora_gpio_info_t)) {
+        caller_size = sizeof(ora_gpio_info_t);
+    }
+
+    ora_gpio_info_t info;
+    info.size = caller_size;
+    info.use = ora_gpio_get_use(gpio);
+#if !defined(TEST_BUILD)
+    info.level = GPIO_READ(gpio) ? 1 : 0;
+    info.is_output = GPIO_IS_OUTPUT(gpio) ? 1 : 0;
+#else // TEST_BUILD
+    info.level = 0;
+    info.is_output = 0;
+#endif // !TEST_BUILD
+
+    memcpy(info_out, &info, caller_size);
+
+    return ORA_RESULT_OK;
+}
+
 void *ora_fn_lookup(api_id_t id) {
     switch (id) {
         case ORA_ID_REBOOT_BOOTSEL:
@@ -855,6 +1082,10 @@ void *ora_fn_lookup(api_id_t id) {
             return ora_map_data_to_phys;
         case ORA_ID_DEMANGLE_ADDR:
             return ora_demangle_addr;
+        case ORA_ID_DEMANGLE_OBSERVED_ADDR:
+            return ora_demangle_observed_addr;
+        case ORA_ID_GET_UNOBSERVED_ADDR_BITS:
+            return ora_get_unobserved_addr_bits;
         case ORA_ID_INIT_KNOCK:
             return ora_init_knock;
         case ORA_ID_WAIT_FOR_KNOCK:
@@ -893,6 +1124,16 @@ void *ora_fn_lookup(api_id_t id) {
             return ora_yield;
         case ORA_ID_READ_RAM_ROM_SLOT:
             return ora_read_ram_rom_slot; 
+
+        case ORA_ID_GET_METADATA_STR:
+            return ora_get_metadata_str;
+        case ORA_ID_GET_METADATA_UINT:
+            return ora_get_metadata_uint;
+
+        case ORA_ID_GPIO_SET:
+            return ora_gpio_set;
+        case ORA_ID_GPIO_QUERY:
+            return ora_gpio_query;
 
         // Deprecated functions
         case ORA_ID_GET_FIRMWARE_INFO:

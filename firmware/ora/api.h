@@ -18,6 +18,321 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include <onerom_metadata_keys_generated.h>
+
+/**
+ * @brief Place an object in a named linker section
+ *
+ * Plugins place certain objects — the plugin header, a ring buffer — at
+ * addresses their linker script fixes, using a named section.  Use this macro
+ * rather than the @c section attribute directly, so the same source also
+ * compiles for a host-side test build, where those sections do not exist and
+ * the attribute would be rejected outright by some host toolchains.
+ *
+ * Expands to nothing when @c ORA_HOST_TEST is defined; to the @c section
+ * attribute otherwise.  Placement on a real device is therefore unchanged.
+ *
+ * @param sec Section name, e.g. ".ring_buf"
+ */
+#if defined(ORA_HOST_TEST)
+#define ORA_SECTION(sec)
+#else
+#define ORA_SECTION(sec) __attribute__((section(sec)))
+#endif
+
+#if defined(ORA_HOST_TEST)
+/**
+ * @brief Host-test seam: translate a device SRAM address to a usable pointer
+ *
+ * Provided by the test harness, not by the firmware.  See @ref ORA_SRAM_PTR.
+ */
+void *ora_host_test_sram_ptr(uint32_t addr);
+
+/**
+ * @brief Host-test seam: hand control back to the harness
+ *
+ * Provided by the test harness, not by the firmware.  See @ref ORA_TEST_YIELD.
+ */
+void ora_host_test_yield(void);
+#endif
+
+/**
+ * @brief Obtain a dereferenceable pointer for a device SRAM address
+ *
+ * Several API calls hand a plugin an address in the device's own address space
+ * — @ref ora_get_ram_slot_info_fn_t returns a RAM slot's base, for instance.
+ * Use this macro to turn such an address into a pointer before dereferencing
+ * it.  Arithmetic on the address itself (bounds checks, offsets, alignment) is
+ * unaffected and should carry on using the plain value; only the dereference
+ * needs converting.
+ *
+ * On a device this is the identity — the address already is a pointer, and the
+ * macro compiles away to nothing.  Under a host-side test build the plugin runs
+ * in a process whose address space is not the device's, and whose pointers are
+ * wider, so the harness maps the address into the emulated SRAM it serves from.
+ *
+ * Call it once per region and keep the pointer, exactly as you would already
+ * hoist a slot base out of a loop; there is no reason to convert per byte.
+ *
+ * Only addresses within the device's SRAM can be mapped.  Flash addresses and
+ * peripheral registers have no host equivalent and are not covered.
+ *
+ * @code
+ * uint32_t slot_base;
+ * get_ram_slot_info(slot, &slot_base, NULL, NULL);
+ * volatile uint8_t *slot = ORA_SRAM_PTR(slot_base);
+ * slot[offset] = value;
+ * @endcode
+ *
+ * @param addr Device SRAM address, as returned by the plugin API
+ *
+ * @since firmware v0.7.1
+ */
+#if defined(ORA_HOST_TEST)
+#define ORA_SRAM_PTR(addr) ora_host_test_sram_ptr(addr)
+#else
+#define ORA_SRAM_PTR(addr) ((void *)(uintptr_t)(addr))
+#endif
+
+/**
+ * @brief Allow a host-side test build to make progress inside a busy-wait
+ *
+ * Place this in any loop whose exit condition depends on state only the other
+ * core or external hardware can change — a spin on a ring-buffer write
+ * pointer, a poll of a location the host writes, a wait on a DMA pointer.
+ *
+ * On a device it compiles to nothing whatsoever.  It is therefore *not* a
+ * delay, *not* a scheduling primitive, and carries no timing guarantee of any
+ * kind; never reach for it to pace a loop.  It is also unrelated to
+ * @ref ORA_ID_YIELD, which is about co-operating with the other plugin over
+ * exclusive access — a different concern entirely, despite the name.
+ *
+ * Under a host-side test build the emulated hardware only advances when the
+ * harness advances it, so a loop like the above would spin forever with
+ * nothing to change its exit condition.  This macro hands control back so the
+ * harness can drive the next stimulus.
+ *
+ * Omitting it costs nothing on a device; the only consequence is that the loop
+ * cannot be exercised on a host.
+ *
+ * @code
+ * while (read_idx == write_idx) {
+ *     ORA_TEST_YIELD();
+ * }
+ * @endcode
+ *
+ * @since firmware v0.7.1
+ */
+#if defined(ORA_HOST_TEST)
+#define ORA_TEST_YIELD() ora_host_test_yield()
+#else
+#define ORA_TEST_YIELD() ((void)0)
+#endif
+
+/**
+ * @defgroup plugin_device_facts Device facts
+ * @brief Absolute addresses and pointer forms that only exist on the device
+ *
+ * A plugin that writes flash has to reach past the plugin API to a handful of
+ * facts about the chip it runs on: where the bootrom's lookup table is, where
+ * flash is mapped, how a pointer to staged code is formed.  Each is a bare
+ * absolute address or a target-specific pointer conversion, so each is a place
+ * a host-side test build would fault rather than misbehave.
+ *
+ * Every one of them is named individually here rather than covered by one
+ * general "read this address" escape hatch.  A general one would let any
+ * absolute access through unexamined, and the value of these is precisely that
+ * the list is short and each entry says which device fact it stands for.  On a
+ * device each compiles to the same expression the plugin used to write inline.
+ *
+ * @{
+ */
+
+/**
+ * @brief Address holding the pointer to the bootrom's table-lookup routine
+ *
+ * Fixed by the RP2350 boot ROM.  Only meaningful on the device.
+ */
+#define ORA_BOOTROM_TABLE_LOOKUP_ADDR 0x00000016u
+
+/** @brief Bootrom table flags selecting the Arm secure entry points */
+#define ORA_BOOTROM_FLAG_ARM_SEC 0x0004u
+
+/** @brief QMI memory-window 0 timing register, whose low byte is the clock
+ * divisor.  Only meaningful on the device. */
+#define ORA_XIP_QMI_M0_TIMING_ADDR 0x400D000Cu
+
+/** @brief Base of the XIP-mapped flash window.  Only meaningful on the
+ * device. */
+#define ORA_FLASH_BASE_ADDR 0x10000000u
+
+/**
+ * @brief Most RAM slots the firmware will report
+ *
+ * A slot index travels in a single byte, and RBCP reserves 0xFF to mean "no
+ * slot is active", so the highest usable index is 0xFE and the count cannot
+ * exceed 255.
+ *
+ * Note that a *host* cannot name every one of those: RBCP rejects 0xAA in
+ * every slot argument, so that a reset started mid-command stays detectable.
+ * A plugin that exposes slots to a host must cap what it advertises at 170
+ * accordingly — see the host-control plugin, which keeps the slots above that
+ * for its own use.
+ */
+#define ORA_MAX_RAM_SLOTS 255u
+
+#if !defined(ORA_HOST_TEST)
+/**
+ * @brief Device implementation of @ref ORA_BOOTROM_LOOKUP
+ *
+ * A function rather than a macro body so that the diagnostic suppression the
+ * absolute dereference needs has somewhere ordinary to live.  The compiler
+ * cannot know that address 0x16 is a valid object, and says so.
+ */
+static inline void *ora_bootrom_lookup_impl(uint32_t code, uint32_t mask) {
+    typedef void *(*ora_rom_table_lookup_fn)(uint32_t code, uint32_t mask);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+    ora_rom_table_lookup_fn lookup = (ora_rom_table_lookup_fn)(uintptr_t) *
+        (uint16_t *)(ORA_BOOTROM_TABLE_LOOKUP_ADDR);
+#pragma GCC diagnostic pop
+    return lookup(code, mask);
+}
+#endif
+
+#if defined(ORA_HOST_TEST)
+/** @brief Host-test seam.  See @ref ORA_BOOTROM_LOOKUP. */
+void *ora_host_test_bootrom_lookup(uint32_t code, uint32_t mask);
+/** @brief Host-test seam.  See @ref ORA_XIP_CLKDIV. */
+uint8_t ora_host_test_xip_clkdiv(void);
+/** @brief Host-test seam.  See @ref ORA_FLASH_OFFSET. */
+uint32_t ora_host_test_flash_offset(const void *addr);
+/** @brief Host-test seam.  See @ref ORA_STAGED_FN_SIZE. */
+uint32_t ora_host_test_staged_fn_size(const void *start, const void *end);
+/** @brief Host-test seam.  See @ref ORA_STAGED_FN_PTR. */
+void *ora_host_test_staged_fn_ptr(uint32_t addr);
+#endif
+
+/**
+ * @brief Look a bootrom function up by its two-character code
+ *
+ * The RP2350 bootrom publishes a table of functions — flash erase, flash
+ * program, XIP control — reached through a lookup routine whose address is
+ * itself stored at a fixed absolute address low in the address map.  A plugin
+ * needs these to touch flash at all, because flash cannot be read while it is
+ * being written and the routines that do it must not themselves be in flash.
+ *
+ * On a device this reads that fixed address and calls through it.  Under a
+ * host-side test build there is no bootrom, and address 0x16 is not mapped, so
+ * the harness supplies stand-ins instead.
+ *
+ * @param code Two-character function code, packed low byte first
+ * @param mask Bootrom table flags selecting the architecture and mode
+ * @return The function's address, or NULL if the bootrom does not publish it
+ *
+ * @since firmware v0.7.2
+ */
+#if defined(ORA_HOST_TEST)
+#define ORA_BOOTROM_LOOKUP(code, mask) ora_host_test_bootrom_lookup((code), (mask))
+#else
+#define ORA_BOOTROM_LOOKUP(code, mask) ora_bootrom_lookup_impl((code), (mask))
+#endif
+
+/**
+ * @brief The XIP clock divisor currently in force
+ *
+ * The erase sequence takes flash out of XIP mode and must put it back the way
+ * it found it, so the divisor has to be read before XIP is disabled and handed
+ * to the routine that restores it.  It lives in a QMI timing register.
+ *
+ * On a device this reads that register.  Under a host-side test build there is
+ * no QMI, and its address is not mapped.
+ *
+ * @since firmware v0.7.2
+ */
+#if defined(ORA_HOST_TEST)
+#define ORA_XIP_CLKDIV() ora_host_test_xip_clkdiv()
+#else
+#define ORA_XIP_CLKDIV()                                                      \
+    ((uint8_t)(*((volatile uint32_t *)(uintptr_t)ORA_XIP_QMI_M0_TIMING_ADDR)  \
+               & 0xFFu))
+#endif
+
+/**
+ * @brief Convert a pointer into flash to an offset the bootrom understands
+ *
+ * The bootrom's flash routines take an offset from the start of flash, while a
+ * plugin knows its reserved region as a linker symbol — an address in the
+ * XIP-mapped window.  This is the conversion between them.
+ *
+ * On a device it is a subtraction from the base of the mapped window.  Under a
+ * host-side test build the object is somewhere in the process's own heap or
+ * BSS, and that subtraction would produce a meaningless — and, on a 64-bit
+ * host, truncated — number, so the harness supplies the offset into whatever
+ * it is standing the region in for.
+ *
+ * @param addr Pointer into the device's flash
+ *
+ * @since firmware v0.7.2
+ */
+#if defined(ORA_HOST_TEST)
+#define ORA_FLASH_OFFSET(addr) ora_host_test_flash_offset((const void *)(addr))
+#else
+#define ORA_FLASH_OFFSET(addr)                                                \
+    ((uint32_t)((uintptr_t)(addr) - ORA_FLASH_BASE_ADDR))
+#endif
+
+/**
+ * @brief Size of a routine bracketed by a pair of linker symbols
+ *
+ * A routine that runs while flash is unreadable must be copied into RAM first,
+ * and the plugin's linker script brackets it with a start and end symbol so
+ * that the plugin can find out how much to copy.
+ *
+ * On a device that is the difference between the two.  Under a host-side test
+ * build there is no such section and therefore no bracketing symbols: whatever
+ * the harness defines under those names are unrelated objects, and the
+ * difference between pointers into unrelated objects is meaningless — it is
+ * not merely inaccurate but arbitrary, and has been observed to be large
+ * enough to fault.  So the harness answers for the size instead.
+ *
+ * @param start First byte of the routine
+ * @param end   One past its last byte
+ *
+ * @since firmware v0.7.2
+ */
+#if defined(ORA_HOST_TEST)
+#define ORA_STAGED_FN_SIZE(start, end) ora_host_test_staged_fn_size((start), (end))
+#else
+#define ORA_STAGED_FN_SIZE(start, end)                                        \
+    ((uint32_t)((const uint8_t *)(end) - (const uint8_t *)(start)))
+#endif
+
+/**
+ * @brief Form a callable pointer to a routine the plugin has staged in SRAM
+ *
+ * Having copied a position-independent routine into a RAM slot, the plugin
+ * calls it through a pointer built from that address.  On a Cortex-M the
+ * pointer must carry the Thumb bit.
+ *
+ * On a device that is the address with its low bit set.  Under a host-side
+ * test build the staged bytes are not executable, the host's instruction set
+ * is not Thumb, and setting the low bit of a host function pointer corrupts
+ * it, so the harness supplies a pointer to its own stand-in for the routine.
+ *
+ * @param type Function pointer type to produce
+ * @param addr Device SRAM address the routine was copied to
+ *
+ * @since firmware v0.7.2
+ */
+#if defined(ORA_HOST_TEST)
+#define ORA_STAGED_FN_PTR(type, addr) ((type)ora_host_test_staged_fn_ptr(addr))
+#else
+#define ORA_STAGED_FN_PTR(type, addr) ((type)(uintptr_t)((addr) | 1u))
+#endif
+
+/** @} */
+
 /**
  * @defgroup plugin_api One ROM Plugin API
  * @brief The complete API for One ROM plugins
@@ -35,6 +350,11 @@
  *
  * This enumeration defines the identifiers for the API functions available
  * to plugins. Each identifier corresponds to a specific API function.
+ *
+ * Every new identifier MUST carry an `@since firmware vX.Y.Z` line in its doc
+ * block, naming the firmware version in which it first became available (which
+ * a plugin targets via its min_fw_version). Identifiers predating this
+ * convention are left unannotated rather than labelled with a guessed version.
  */
 typedef enum {
     /**
@@ -248,8 +568,9 @@ typedef enum {
     ORA_ID_GET_FLASH_SLOT_INFO = 0x00000022,
 
     /**
-     * @brief Get extended information about a flash slot
+     * @brief Get extended, per-ROM information about a flash slot
      * @sa ora_get_flash_slot_ext_info_fn_t
+     * @since firmware 0.7.1
      */
     ORA_ID_GET_FLASH_SLOT_EXT_INFO = 0x00000023,
 
@@ -294,6 +615,55 @@ typedef enum {
      * @sa ora_read_ram_rom_slot_fn_t
      */
     ORA_ID_READ_RAM_ROM_SLOT         = 0x0000002A,
+
+    /**
+     * @brief Get a device-level metadata string by key
+     * @sa ora_get_metadata_str_fn_t
+     * @since firmware 0.7.1
+     */
+    ORA_ID_GET_METADATA_STR          = 0x0000002B,
+
+    /**
+     * @brief Get a device-level unsigned metadata value by key
+     *
+     * Numeric sibling of ORA_ID_GET_METADATA_STR over the same unified key
+     * space. Resolves, among others, ORA_METADATA_KEY_STATUS_LED_STATE - the
+     * live status-LED state and cross-plugin coordination channel (see
+     * ora_set_status_led_fn_t).
+     * @sa ora_get_metadata_uint_fn_t
+     * @since firmware 0.7.1
+     */
+    ORA_ID_GET_METADATA_UINT         = 0x0000002C,
+
+    /**
+     * @brief Demangle a captured physical address to the address the device
+     *        observes on its address lines
+     * @sa ora_demangle_observed_addr_fn_t
+     * @since firmware 0.7.1
+     */
+    ORA_ID_DEMANGLE_OBSERVED_ADDR    = 0x0000002D,
+
+    /**
+     * @brief Get the number of least-significant address bits the device does
+     *        not observe for the current ROM
+     * @sa ora_get_unobserved_addr_bits_fn_t
+     * @since firmware 0.7.1
+     */
+    ORA_ID_GET_UNOBSERVED_ADDR_BITS  = 0x0000002E,
+
+    /**
+     * @brief Drive a GPIO high or low, or release it to high impedance
+     * @sa ora_gpio_set_fn_t
+     * @since firmware 0.7.1
+     */
+    ORA_ID_GPIO_SET                  = 0x0000002F,
+
+    /**
+     * @brief Query what One ROM is using a GPIO for, and its current state
+     * @sa ora_gpio_query_fn_t
+     * @since firmware 0.7.1
+     */
+    ORA_ID_GPIO_QUERY                = 0x00000030,
 
     /** Invalid API identifier */
     ORA_ID_INVALID = 0xFFFFFFFF,
@@ -452,9 +822,25 @@ typedef struct {
  * setup_address_monitor(ring_buf, 6, ORA_MONITOR_MODE_CONTROL, NULL);
  * @endcode
  *
+ * Under a host-side test build (@c ORA_HOST_TEST) these declare a pointer
+ * instead of an array, with external linkage, which the harness points at a
+ * suitably aligned region of the SRAM it emulates before the plugin's entry
+ * point runs.  The capture DMA writes into emulated SRAM specifically, so a
+ * buffer in ordinary host memory would not receive anything; and a plugin's
+ * uses — passing it to @ref ora_setup_address_monitor_fn_t, indexing it,
+ * differencing it against the write pointer — read identically either way.
+ *
  * @param name              Name for the ring buffer array
  * @param ring_entries_log2 Log2 of the number of entries, e.g. 6 for 64 entries
  */
+#if defined(ORA_HOST_TEST)
+#define ORA_RING_BUF_DECLARE_8BIT(name, ring_entries_log2)  \
+    volatile uint32_t *name
+#define ORA_RING_BUF_DECLARE_16BIT(name, ring_entries_log2) \
+    volatile uint32_t *name
+#define ORA_RING_BUF_DECLARE_32BIT(name, ring_entries_log2) \
+    volatile uint32_t *name
+#else
 #define ORA_RING_BUF_DECLARE_8BIT(name, ring_entries_log2)  \
     static volatile uint32_t __attribute__((aligned(        \
         ORA_RING_BUF_SIZE_8BIT(ring_entries_log2)           \
@@ -467,7 +853,8 @@ typedef struct {
     static volatile uint32_t __attribute__((aligned(        \
         ORA_RING_BUF_SIZE_32BIT(ring_entries_log2)          \
     ))) name[1u << (ring_entries_log2)]
-    
+#endif
+
 /**
  * @brief IRQ handler function type
  *
@@ -620,6 +1007,9 @@ typedef enum {
     ORA_RESULT_INVALID_SLOT = 8,
     ORA_RESULT_NO_SLOT_ACTIVE = 9,
     ORA_RESULT_NOT_SUPPORTED = 10,
+    ORA_RESULT_TYPE_MISMATCH = 11,
+    /** @since firmware 0.7.1 */
+    ORA_RESULT_GPIO_IN_USE = 12,
 } ora_result_t;
 
 /**
@@ -772,8 +1162,18 @@ typedef size_t (*ora_get_free_mem_fn_t)(void);
  * @brief Set the status LED on or off
  * @sa ORA_ID_SET_STATUS_LED
  *
- * This controls the status LED, if is enabled and properly configured.  If it
- * is not, this function silently fails.
+ * Sets the live status-LED state. This is the single coordination channel for
+ * the status LED: the call records the new state (readable by any plugin as
+ * ORA_METADATA_KEY_STATUS_LED_STATE via ora_get_metadata_uint_fn_t) and drives
+ * the status-LED GPIO. The board's configured default (the `led` option) only
+ * seeds the initial state; a plugin may turn the LED on even if it was
+ * configured off. If the board has no status-LED GPIO the call does nothing.
+ *
+ * Coordination without cross-plugin awareness: on a board where the status LED
+ * and a neopixel share a GPIO, the neopixel-driving plugin owns the pin and
+ * should render the status LED by reading STATUS_LED_STATE each frame - so a
+ * write here is reflected by that plugin without either plugin knowing about
+ * the other. Neither plugin references the other; they meet at this flag.
  *
  * @param on Set to 1 to turn the LED on, or 0 to turn it off.
  */
@@ -1039,12 +1439,21 @@ typedef uint32_t (*ora_map_addr_to_phys_fn_t)(uint32_t logical_addr);
 typedef uint8_t (*ora_map_data_to_phys_fn_t)(uint8_t logical_data);
 
 /**
- * @brief Demangle a captured physical address back to a logical address
+ * @brief Demangle a captured physical address back to a logical byte address
  * @sa ORA_ID_DEMANGLE_ADDR
  *
- * Converts a raw GPIO capture from the ring buffer back to the logical ROM
- * address it represents, based on the firmware's internal pin mapping for the
- * current hardware variant.
+ * Converts a raw GPIO capture from the ring buffer to the logical ROM address
+ * it represents — the byte-addressable index into the ROM image, and the exact
+ * inverse of @ref ora_map_addr_to_phys_fn_t. This is the space for reading and
+ * writing ROM image bytes.
+ *
+ * On the 24-, 28- and 32-pin variants this also equals the address observed on
+ * the bus. On the 40-pin variant the ROM's least-significant address line is
+ * served through a separately-read pin the address monitor does not sample, so
+ * bit 0 of this logical address is not a bus line — it is the byte-within-word
+ * select (A-1) on a word-organised ×16 ROM (e.g. 27C400/27C200), or A0 on an
+ * 8-bit 40-pin ROM. To decode signalling captured from the address bus, use
+ * @ref ora_demangle_observed_addr_fn_t instead.
  *
  * If check_control_pins is non-zero, the function will validate that the
  * control pins (X1, X2, CS1) are inactive in the capture. If any are active,
@@ -1052,7 +1461,7 @@ typedef uint8_t (*ora_map_data_to_phys_fn_t)(uint8_t logical_data);
  * left unchanged.
  *
  * @param physical_addr         Raw GPIO capture from the ring buffer
- * @param logical_addr_out      Output logical ROM address
+ * @param logical_addr_out      Output logical (byte) ROM address
  * @param check_control_pins    If non-zero, fail if any control pins are active
  * @return ORA_RESULT_OK on success, ORA_RESULT_CONTROL_PIN_ACTIVE if
  *         check_control_pins is set and a control pin is found to be active,
@@ -1062,6 +1471,91 @@ typedef ora_result_t (*ora_demangle_addr_fn_t)(
     uint32_t physical_addr,
     uint32_t *logical_addr_out,
     uint8_t check_control_pins
+);
+
+/**
+ * @brief Demangle a captured physical address to the observed bus address
+ * @sa ORA_ID_DEMANGLE_OBSERVED_ADDR
+ *
+ * Converts a raw GPIO capture from the ring buffer to the address present on
+ * the address lines the device physically observes — least-significant observed
+ * line as bit 0. This is the address space host-to-device signalling travels
+ * in, so it is the function to use when decoding commands captured by the
+ * address monitor. To read or write ROM image bytes instead, use
+ * @ref ora_demangle_addr_fn_t / @ref ora_map_addr_to_phys_fn_t.
+ *
+ * Whether this differs from @ref ora_demangle_addr_fn_t is fixed by the One ROM
+ * variant, not the individual ROM:
+ *
+ *   - 24-, 28- and 32-pin variants observe every address line. The observed
+ *     address equals the logical byte address, and this returns exactly what
+ *     @ref ora_demangle_addr_fn_t returns.
+ *   - The 40-pin variant serves the ROM's least-significant address line through
+ *     a separately-read pin the address monitor does not sample. The observed
+ *     address omits that line, so this returns one bit fewer than
+ *     @ref ora_demangle_addr_fn_t, for every ROM on the variant. The omitted
+ *     line is the byte-within-word select (A-1) on a word-organised ×16 ROM such
+ *     as the 27C400 or 27C200, and A0 on an 8-bit 40-pin ROM; the arithmetic is
+ *     the same either way.
+ *
+ * The exact number of low bits dropped for the current ROM is reported by
+ * @ref ora_get_unobserved_addr_bits_fn_t (0 on 24/28/32-pin, 1 on 40-pin).
+ *
+ * If check_control_pins is non-zero, validates that the control pins (X1, X2,
+ * CS1) are inactive in the capture, returning ORA_RESULT_CONTROL_PIN_ACTIVE and
+ * leaving observed_addr_out unchanged if any are active.
+ *
+ * @param physical_addr        Raw GPIO capture from the ring buffer
+ * @param observed_addr_out    Output observed bus address
+ * @param check_control_pins   If non-zero, fail if any control pins are active
+ * @return ORA_RESULT_OK on success, ORA_RESULT_CONTROL_PIN_ACTIVE if
+ *         check_control_pins is set and a control pin is active, or
+ *         ORA_RESULT_ERROR on failure
+ */
+typedef ora_result_t (*ora_demangle_observed_addr_fn_t)(
+    uint32_t physical_addr,
+    uint32_t *observed_addr_out,
+    uint8_t check_control_pins
+);
+
+/**
+ * @brief Get the number of least-significant address bits the device does not
+ *        observe for the current ROM
+ * @sa ORA_ID_GET_UNOBSERVED_ADDR_BITS
+ *
+ * Reports how the device treats the current ROM's addresses: the number of
+ * low-order logical address bits not present on the lines the address monitor
+ * observes, written to *bits_out. This is the bit difference between
+ * @ref ora_demangle_addr_fn_t (logical byte address) and
+ * @ref ora_demangle_observed_addr_fn_t (observed bus address) for this ROM. The
+ * host's signalling stride is 1 << that value.
+ *
+ * The value is fixed by the One ROM variant:
+ *
+ *   - 0 on the 24-, 28- and 32-pin variants: every address line is observed;
+ *     stride 1; the least-significant address line carries command data.
+ *   - 1 on the 40-pin variant: the least-significant line is served through a
+ *     separately-read pin the monitor does not sample; stride 2; that line
+ *     carries no command data. This holds for every ROM on the variant — the
+ *     ×16 parts (27C400/27C200) and 8-bit 40-pin parts alike.
+ *
+ * A plugin can combine this with the ROM byte size
+ * (@ref ora_get_chip_size_from_type_fn_t) to bound host-supplied address pages:
+ * the observed address span is (byte size >> the returned value).
+ *
+ * This is device-side information for the plugin's own use. The addressing
+ * behaviour cannot be discovered over the wire at session time — a host must
+ * already know it to frame the initiating knock — so it is never reported to
+ * the host; a host obtains it from the plugin's documentation, agreed in
+ * advance.
+ *
+ * @param bits_out  Output: number of unobserved least-significant address bits
+ *                  for the current ROM. Unchanged on failure.
+ * @return ORA_RESULT_OK on success, ORA_RESULT_INVALID_ARG if bits_out is NULL,
+ *         or an error result if no ROM is currently being served
+ */
+typedef ora_result_t (*ora_get_unobserved_addr_bits_fn_t)(
+    uint8_t *bits_out
 );
 
 /**
@@ -1234,19 +1728,16 @@ typedef volatile uint32_t * volatile *(*ora_get_address_monitor_ring_write_pos_f
  *
  * Returns the total number of RAM slots available for the ROM type currently
  * being served. Slot 0 is always the primary slot, pre-populated by the
- * firmware on boot. The number of available slots varies by ROM type, for
- * example, the number of slots _might_ be as follows, but plugins must not
- * rely on these exact numbers and instead use this function to query the
- * number of slots at runtime:
- * - 64KB ROM image on flash:  up to 7 slots
- * - 128KB ROM image on flash: up to 3 slots
- * - 256KB ROM image on flash: up to 2 slots
- * - 512KB ROM image on flash: 1 slot only
- * 
- * Note that sizes above are the size of the ROM image slot on flash, which is
- * normally larger than the actual ROM type being served.
+ * firmware on boot.
  *
- * @return Total number of RAM slots available
+ * A slot is exactly one ROM region, so the count is however many of those fit
+ * in the RAM reserved for them — with a small ROM that can be a great many,
+ * and with a 512KB one it is a single slot. Plugins must not assume any
+ * particular number, and in particular must not assume a slot is large enough
+ * for some purpose of their own: a slot is as small as the ROM being served,
+ * which can be 2KB or less.
+ *
+ * @return Total number of RAM slots available, at most @ref ORA_MAX_RAM_SLOTS
  */
 typedef uint8_t (*ora_get_ram_slot_count_fn_t)(void);
 
@@ -1378,23 +1869,49 @@ typedef ora_result_t (*ora_get_flash_slot_info_fn_t)(
 );
 
 /**
- * @brief Get extended information about a flash slot
+ * @brief Get extended, per-ROM information about a flash slot
  * @sa ORA_ID_GET_FLASH_SLOT_EXT_INFO
+ * @since firmware 0.7.1
  *
- * @warning This function is not yet implemented. Calling it is undefined
- * behaviour. It is reserved for future use to expose per-ROM details within
- * multi-ROM flash slots, such as individual ROM filenames, types, and CS
- * states. Its parameter list and behaviour are subject to change without
- * notice.
+ * Returns details for a single ROM image within a flash slot, addressed by
+ * @p rom_index. A multi-ROM set exposes each constituent ROM; a single-ROM
+ * slot has exactly one ROM at index 0. The number of ROMs in a slot is the
+ * @p rom_count_out returned by @ref ora_get_flash_slot_info_fn_t.
  *
- * @param flash_slot    Index of the flash slot to query
- * @param flags         Filtering flags
- * // TBD - multi-ROM detail parameters
+ * Unlike @ref ora_get_flash_slot_info_fn_t, which reports the ROM type only as
+ * its numeric RBCP value, this reports @p rom_type_out — the ROM type string
+ * exactly as the user specified it when programming (e.g. "27LC512" rather than
+ * the canonical "27512"). All string outputs receive pointers directly into
+ * flash memory — no allocation is required. All output pointers are optional;
+ * pass NULL for any value not required.
+ *
+ * @param flash_slot        Index of the flash slot to query, filtered as per
+ *                          @ref ora_get_flash_slot_count_fn_t
+ * @param rom_index         Index of the ROM within the slot (0-based, less than
+ *                          the slot's rom_count)
+ * @param flags             Filtering flags, must match those passed to
+ *                          @ref ora_get_flash_slot_count_fn_t
+ * @param rom_type_out      Receives the ROM type string as specified by the
+ *                          user. Never NULL on success. May be NULL if not
+ *                          required.
+ * @param filename_out      Receives the ROM's filename string, or NULL if none.
+ *                          May be NULL if not required.
+ * @param chip_size_out     Receives the ROM's size in bytes. May be NULL if not
+ *                          required.
+ * @param rbcp_rom_type_out Receives the ROM type as its RBCP wire value. May be
+ *                          NULL if not required.
+ * @return ORA_RESULT_OK on success, ORA_RESULT_INVALID_SLOT if flash_slot is
+ *         out of range for the given flags, ORA_RESULT_INVALID_ARG if rom_index
+ *         is out of range for the slot
  */
 typedef ora_result_t (*ora_get_flash_slot_ext_info_fn_t)(
     uint8_t flash_slot,
-    uint32_t flags
-    // TBD - multi-ROM detail
+    uint8_t rom_index,
+    uint32_t flags,
+    const char **rom_type_out,
+    const char **filename_out,
+    uint32_t *chip_size_out,
+    uint32_t *rbcp_rom_type_out
 );
 
 /** @brief Perform the copy asynchronously via DMA */
@@ -1449,6 +1966,54 @@ typedef ora_result_t (*ora_copy_flash_slot_to_ram_slot_fn_t)(
  * @return ORA_RESULT_OK on success, ORA_RESULT_ERROR on failure
  */
 typedef ora_result_t (*ora_get_device_version_fn_t)(uint8_t *version_out, uint32_t max_len);
+
+/**
+ * @brief Get a device-level metadata string by key
+ * @sa ORA_ID_GET_METADATA_STR
+ *
+ * Retrieves a device-level metadata string identified by @p key. The metadata
+ * key space is unified across accessors; this accessor resolves only keys whose
+ * datum is a string.
+ *
+ * On success @p out receives a pointer directly into flash - no allocation is
+ * required, and the pointer is valid for the lifetime of the firmware. If the
+ * requested field is present but unset (for example an absent serial number
+ * override), the call succeeds with @p out set to NULL: an unset field is data,
+ * not an error.
+ *
+ * The firmware returns stored metadata verbatim and applies no interpretation.
+ * Deriving effective values (e.g. a serial from the MCU chip ID) or formatting
+ * for presentation is the caller's responsibility.
+ *
+ * @param key  The metadata datum to retrieve. @sa ora_metadata_key_t
+ * @param out  Output pointer to receive the string pointer, or NULL if the
+ *             field is unset. Must not itself be NULL.
+ * @return ORA_RESULT_OK on success (including the unset case, @p out = NULL);
+ *         ORA_RESULT_NOT_SUPPORTED if @p key is unknown to this firmware;
+ *         ORA_RESULT_TYPE_MISMATCH if @p key is valid but not a string;
+ *         ORA_RESULT_INVALID_ARG if @p out is NULL.
+ */
+typedef ora_result_t (*ora_get_metadata_str_fn_t)(ora_metadata_key_t key, const char **out);
+
+/**
+ * @brief Get a device-level unsigned metadata value by key
+ * @sa ORA_ID_GET_METADATA_UINT
+ *
+ * Numeric sibling of ora_get_metadata_str_fn_t over the same unified key space.
+ * Resolves keys whose datum is an unsigned scalar or enum, zero-extending the
+ * stored value into @p out. Hardware-topology keys (e.g. ORA_METADATA_KEY_GPIO_
+ * STATUS, ORA_METADATA_KEY_GPIO_NEOPIXEL) resolve from device metadata; live
+ * keys (e.g. ORA_METADATA_KEY_STATUS_LED_STATE) resolve from runtime state and
+ * therefore reflect the current value on each call.
+ *
+ * @param key  The metadata datum to retrieve. @sa ora_metadata_key_t
+ * @param out  Output pointer to receive the value. Must not be NULL.
+ * @return ORA_RESULT_OK on success;
+ *         ORA_RESULT_NOT_SUPPORTED if @p key is unknown to this firmware;
+ *         ORA_RESULT_TYPE_MISMATCH if @p key is valid but not an unsigned value;
+ *         ORA_RESULT_INVALID_ARG if @p out is NULL.
+ */
+typedef ora_result_t (*ora_get_metadata_uint_fn_t)(ora_metadata_key_t key, uint32_t *out);
 
 /**
  * @brief Demangle a captured physical data byte back to a logical byte
@@ -1577,6 +2142,181 @@ typedef ora_result_t (*ora_read_ram_rom_slot_fn_t)(
     uint32_t  offset,
     uint8_t  *buf,
     uint32_t  len
+);
+
+/**
+ * @brief State a GPIO can be placed in by @ref ora_gpio_set_fn_t
+ * @since firmware 0.7.1
+ */
+typedef enum {
+    /** @brief Drive the GPIO low */
+    ORA_GPIO_STATE_LOW   = 0,
+
+    /** @brief Drive the GPIO high */
+    ORA_GPIO_STATE_HIGH  = 1,
+
+    /**
+     * @brief Release the GPIO - output driver disabled, high impedance
+     *
+     * The input path stays enabled, so the pin can still be read via
+     * @ref ora_gpio_query_fn_t.
+     */
+    ORA_GPIO_STATE_INPUT = 2,
+} ora_gpio_state_t;
+
+/**
+ * @brief What One ROM itself is using a GPIO for
+ * @since firmware 0.7.1
+ *
+ * Reports only what the firmware has claimed the GPIO for: the serving set of
+ * the currently active ROM slot, plus the board's own system pins. It says
+ * nothing about what is attached to the pin electrically - whether a jumper is
+ * fitted, what the far end of a wire is connected to, or whether something else
+ * is driving the net. That remains the user's responsibility.
+ *
+ * Serving reads its address, chip select and /BYTE pins as SIO inputs with the
+ * output driver disabled, so they are indistinguishable from unused pins by
+ * register inspection alone; this enumeration is the only way to tell them
+ * apart.
+ *
+ * What is reported is the *consequence* of driving the GPIO, not the role it
+ * plays. The roles - address, data, chip select, /BYTE, X - are deliberately
+ * not reported: naming them needs the board pin map and the active chip's
+ * metadata, which a host already has, whereas whether One ROM drives or merely
+ * reads a pin is knowledge only the firmware has.
+ */
+typedef enum {
+    /** @brief Not used by One ROM */
+    ORA_GPIO_USE_FREE           = 0,
+
+    /**
+     * @brief Serving reads this GPIO; driving it is reversible
+     *
+     * Covers the whole address span of the active ROM slot - including any X
+     * expansion pins folded into it on Multi and Banked slots - the whole chip
+     * select span, including any position the select field masks out and any
+     * excess address line acting as a half-select, and the /BYTE pin.
+     *
+     * These are all SIO inputs, and PIO keeps reading the pin whatever its
+     * function select says, so driving one and then releasing it with
+     * ORA_GPIO_STATE_INPUT restores serving exactly.
+     * @sa ora_gpio_set_fn_t
+     */
+    ORA_GPIO_USE_SERVING_READ   = 1,
+
+    /**
+     * @brief Serving drives this GPIO; driving it breaks serving until reboot
+     *
+     * The data pins of the active ROM slot, which PIO owns and drives. Taking
+     * one away from PIO is not undone by releasing it.
+     * @sa ora_gpio_set_fn_t
+     */
+    ORA_GPIO_USE_SERVING_DRIVEN = 2,
+
+    /** @brief A board system pin - status LED, neopixel, VBUS or ext flash CS */
+    ORA_GPIO_USE_SYSTEM         = 3,
+} ora_gpio_use_t;
+
+/**
+ * @brief Drive a GPIO even if One ROM is using it
+ * @sa ora_gpio_set_fn_t
+ * @since firmware 0.7.1
+ */
+#define ORA_GPIO_FLAG_FORCE  (1u << 0)
+
+/**
+ * @brief GPIO information returned by @ref ora_gpio_query_fn_t
+ * @since firmware 0.7.1
+ */
+typedef struct {
+    /**
+     * @brief In: sizeof this structure as known to the caller.  Out: the
+     * number of bytes the firmware actually wrote.
+     *
+     * The caller sets this to sizeof(ora_gpio_info_t) as it knows it before
+     * calling. The firmware writes at most that many bytes and sets this field
+     * to how many it wrote, so a plugin built against an older or newer version
+     * of this structure than the running firmware still interoperates.
+     */
+    uint8_t size;
+
+    /** @brief What One ROM is using this GPIO for. @sa ora_gpio_use_t */
+    uint8_t use;
+
+    /** @brief The level currently present on the pad, 0 or 1 */
+    uint8_t level;
+
+    /** @brief 1 if the pin's output driver is currently enabled, 0 if not */
+    uint8_t is_output;
+} ora_gpio_info_t;
+STATIC_ASSERT(sizeof(ora_gpio_info_t) == 4, "ora_gpio_info_t must be 4 bytes");
+
+/**
+ * @brief Drive a GPIO high or low, or release it to high impedance
+ * @sa ORA_ID_GPIO_SET
+ * @since firmware 0.7.1
+ *
+ * Takes the GPIO under SIO control and applies @p state immediately. The call
+ * is instantaneous: it starts no timer and schedules nothing. A caller wanting
+ * a bounded assertion must time the release itself.
+ *
+ * By default the call refuses, with ORA_RESULT_GPIO_IN_USE, any GPIO whose
+ * @ref ora_gpio_use_t is not ORA_GPIO_USE_FREE. This is the firmware's whole
+ * safety model - it knows what One ROM itself has claimed, and nothing about
+ * what is wired to the pin. @ref ORA_GPIO_FLAG_FORCE overrides the refusal.
+ *
+ * How recoverable a forced pin is is exactly what @ref ora_gpio_use_t reports:
+ *
+ *   - ORA_GPIO_USE_SERVING_DRIVEN - the pin is driven by PIO. Forcing it takes
+ *     the pin's function select away from PIO, and the serving path does not
+ *     restore it, so serving is broken until the device reboots. Setting the
+ *     pin back to ORA_GPIO_STATE_INPUT does not undo this.
+ *   - ORA_GPIO_USE_SERVING_READ - the pin is an SIO input with its output
+ *     driver disabled, and PIO keeps reading it whatever its function select
+ *     says. Forcing one is therefore reversible: set it back to
+ *     ORA_GPIO_STATE_INPUT and serving reads the pin as before. While it is
+ *     driven, of course, serving sees the level being driven.
+ *
+ * Only the function select, the output enable and the pad's output-disable bit
+ * are altered. Pulls, drive strength, slew rate and any input polarity
+ * inversion are left untouched, which is what makes the release above exact.
+ *
+ * @param gpio   The GPIO to set, less than the running variant's GPIO count
+ * @param state  The state to place the GPIO in. @sa ora_gpio_state_t
+ * @param flags  Behavioural flags. Pass 0 for default behaviour.
+ *               @sa ORA_GPIO_FLAG_FORCE
+ * @return ORA_RESULT_OK on success; ORA_RESULT_GPIO_IN_USE if the GPIO is in
+ *         use by One ROM and ORA_GPIO_FLAG_FORCE was not set;
+ *         ORA_RESULT_INVALID_ARG if @p gpio is out of range or @p state is not
+ *         a valid @ref ora_gpio_state_t
+ */
+typedef ora_result_t (*ora_gpio_set_fn_t)(
+    uint8_t  gpio,
+    uint8_t  state,
+    uint32_t flags
+);
+
+/**
+ * @brief Query what One ROM is using a GPIO for, and its current state
+ * @sa ORA_ID_GPIO_QUERY
+ * @since firmware 0.7.1
+ *
+ * Reports the GPIO's use, the level present on the pad, and whether its output
+ * driver is enabled. There is deliberately no bulk form - a caller wanting the
+ * whole device loops over this call.
+ *
+ * The caller must set @p info_out->size to its own sizeof(ora_gpio_info_t)
+ * before calling; see @ref ora_gpio_info_t.
+ *
+ * @param gpio      The GPIO to query, less than the running variant's GPIO count
+ * @param info_out  Structure to fill in, with its size field already set
+ * @return ORA_RESULT_OK on success; ORA_RESULT_INVALID_ARG if @p info_out is
+ *         NULL or @p gpio is out of range; ORA_RESULT_INVALID_SIZE if
+ *         @p info_out->size is zero
+ */
+typedef ora_result_t (*ora_gpio_query_fn_t)(
+    uint8_t gpio,
+    ora_gpio_info_t *info_out
 );
 
 /** @} */ // plugin_api_functions

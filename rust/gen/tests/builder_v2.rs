@@ -15,7 +15,7 @@ mod tests {
     use onerom_config::fw::{FirmwareProperties, FirmwareVersion, ServeAlg};
     use onerom_config::hw::Board;
     use onerom_config::mcu::{Family as McuFamily, Variant as McuVariant};
-    use onerom_gen::{Builder, FileData};
+    use onerom_gen::{Builder, ConfigOverrides, ConfigWarning, Error as GenError, FileData};
     use onerom_metadata::{
         CURRENT_METADATA_VERSION, DeviceMemoryView, METADATA_BASE, METADATA_SIZE,
         ONEROM_METADATA_MAGIC,
@@ -208,11 +208,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -288,16 +284,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0x55u8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
+        b.add_file(FileData::new(1, vec![0x55u8; 8192])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -371,21 +359,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0x11u8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0x22u8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 2,
-            data: vec![0x33u8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0x11u8; 8192])).unwrap();
+        b.add_file(FileData::new(1, vec![0x22u8; 8192])).unwrap();
+        b.add_file(FileData::new(2, vec![0x33u8; 8192])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -465,26 +441,10 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0x11u8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0x22u8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 2,
-            data: vec![0x33u8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 3,
-            data: vec![0x44u8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0x11u8; 8192])).unwrap();
+        b.add_file(FileData::new(1, vec![0x22u8; 8192])).unwrap();
+        b.add_file(FileData::new(2, vec![0x33u8; 8192])).unwrap();
+        b.add_file(FileData::new(3, vec![0x44u8; 8192])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -565,16 +525,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0x55u8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
+        b.add_file(FileData::new(1, vec![0x55u8; 8192])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -625,11 +577,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
 
         let (meta, _rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -637,6 +585,113 @@ mod tests {
         assert_eq!(v.read_u8(HDR_BOOT_LOGGING).unwrap(), 1);
         assert_eq!(v.read_u8(HDR_SWD_ENABLED).unwrap(), 1);
         assert_eq!(v.read_u8(HDR_TURBO_BOOT).unwrap(), 1);
+    }
+
+    /// Turbo boot with more than one non-plugin slot is refused by default,
+    /// and accepted - reported as a warning - when the caller overrides it.
+    ///
+    /// Asserts the accepted build still sets the turbo boot header flag, so a
+    /// build that quietly dropped turbo boot to make the config legal would
+    /// not pass.
+    #[test]
+    fn v2_turbo_boot_multi_slot() {
+        let json = r#"{
+            "version": 1,
+            "description": "turbo boot, two slots",
+            "turbo_boot": true,
+            "chip_sets": [{
+                "type": "single",
+                "chips": [{ "file": "one.bin", "type": "2364", "cs1": "active_low" }]
+            }, {
+                "type": "single",
+                "chips": [{ "file": "two.bin", "type": "2364", "cs1": "active_low" }]
+            }]
+        }"#;
+
+        let version = FirmwareVersion::new(0, 7, 0, 0);
+
+        let err = Builder::from_json(version, McuFamily::Rp2350, json)
+            .expect_err("turbo boot with two slots must be refused by default");
+        assert!(
+            matches!(err, GenError::TurboBootMultiSlot { slots: 2 }),
+            "unexpected error: {err}"
+        );
+
+        let overrides = ConfigOverrides::default().allow_turbo_boot_multi_slot(true);
+        let (mut b, warnings) =
+            Builder::from_json_with_overrides(version, McuFamily::Rp2350, json, &overrides)
+                .expect("the override must allow the config to build");
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [ConfigWarning::TurboBootMultiSlot { slots: 2 }]
+            ),
+            "expected one turbo boot warning, got {warnings:?}"
+        );
+
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
+        b.add_file(FileData::new(1, vec![0xBBu8; 8192])).unwrap();
+
+        let (meta, _rom) = b.build(v2_props(Board::Fire24A)).expect("build");
+        assert_eq!(view(&meta).read_u8(HDR_TURBO_BOOT).unwrap(), 1);
+    }
+
+    /// A single non-plugin slot is the ordinary turbo boot case, and needs no
+    /// override.
+    #[test]
+    fn v2_turbo_boot_single_slot_no_warning() {
+        let json = r#"{
+            "version": 1,
+            "description": "turbo boot, one slot",
+            "turbo_boot": true,
+            "chip_sets": [{
+                "type": "single",
+                "chips": [{ "file": "test.bin", "type": "2364", "cs1": "active_low" }]
+            }]
+        }"#;
+
+        let overrides = ConfigOverrides::default().allow_turbo_boot_multi_slot(true);
+        let (_b, warnings) = Builder::from_json_with_overrides(
+            FirmwareVersion::new(0, 7, 0, 0),
+            McuFamily::Rp2350,
+            json,
+            &overrides,
+        )
+        .expect("from_json_with_overrides should succeed");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// Boot logging with SWD disabled is a supported combination: SWD stays up
+    /// for the whole of boot, so the boot log is emitted in full, and is only
+    /// shut off when serving starts.  This pairing used to be rejected by
+    /// validate_config_v2.
+    ///
+    /// Asserts the build succeeds *and* that both flags reach the header with
+    /// the values asked for - a build that quietly forced swd_enabled back to
+    /// 1 would otherwise pass.
+    #[test]
+    fn v2_boot_logging_with_swd_disabled() {
+        let json = r#"{
+            "version": 1,
+            "description": "boot logging, SWD off",
+            "swd_enabled": false,
+            "boot_logging": true,
+            "chip_sets": [{
+                "type": "single",
+                "chips": [{ "file": "test.bin", "type": "2364", "cs1": "active_low" }]
+            }]
+        }"#;
+
+        let mut b = v2_builder(json);
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
+
+        let (meta, _rom) = b
+            .build(v2_props(Board::Fire24A))
+            .expect("boot_logging with swd_enabled = false must build");
+        let v = view(&meta);
+
+        assert_eq!(v.read_u8(HDR_BOOT_LOGGING).unwrap(), 1);
+        assert_eq!(v.read_u8(HDR_SWD_ENABLED).unwrap(), 0);
     }
 
     // ========================================================================
@@ -660,11 +715,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
 
         let (meta, _rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -710,11 +761,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
 
         let (meta, _rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -761,11 +808,7 @@ mod tests {
 
         let mut b = v2_builder(json);
         // 23QL384 = 48KB = 49152 bytes
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 49152],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 49152])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire28A)).expect("build");
         let v = view(&meta);
@@ -830,11 +873,7 @@ mod tests {
 
         let mut b = v2_builder(json);
         // 27C400 = 512KB byte-mode image = 524288 bytes
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 524288],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 524288])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire40A)).expect("build");
         let v = view(&meta);
@@ -898,16 +937,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0xBBu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
+        b.add_file(FileData::new(1, vec![0xBBu8; 8192])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24E)).expect("build");
         let v = view(&meta);
@@ -986,21 +1017,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0xBBu8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 2,
-            data: vec![0xCCu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
+        b.add_file(FileData::new(1, vec![0xBBu8; 8192])).unwrap();
+        b.add_file(FileData::new(2, vec![0xCCu8; 8192])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24E)).expect("build");
         let v = view(&meta);
@@ -1074,16 +1093,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 16384],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0xBBu8; 16384],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 16384])).unwrap();
+        b.add_file(FileData::new(1, vec![0xBBu8; 16384])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire28C)).expect("build");
         let v = view(&meta);
@@ -1159,16 +1170,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 16384],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0xBBu8; 16384],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 16384])).unwrap();
+        b.add_file(FileData::new(1, vec![0xBBu8; 16384])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire28C)).expect("build");
         let v = view(&meta);
@@ -1239,10 +1242,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 524288], // 27C400 = 512KB byte-mode image
-        })
+        b.add_file(
+            FileData::new(0, vec![0xAAu8; 524288]), /* 27C400 = 512KB byte-mode image */
+        )
         .unwrap();
 
         let (meta, _rom) = b.build(v2_props(Board::Fire40A)).expect("build");
@@ -1303,11 +1305,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 524288],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 524288])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire40A)).expect("build");
         let v = view(&meta);
@@ -1368,11 +1366,7 @@ mod tests {
 
         let mut b = v2_builder(json);
         // 27C200 = 256KB byte-mode image = 262144 bytes
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 262144],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 262144])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire40A)).expect("build");
         let v = view(&meta);
@@ -1437,10 +1431,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 131072], // 27C010 = 128KB
-        })
+        b.add_file(
+            FileData::new(0, vec![0xAAu8; 131072]), /* 27C010 = 128KB */
+        )
         .unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire32B)).expect("build");
@@ -1499,10 +1492,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 524288], // 27C040 = 512KB
-        })
+        b.add_file(
+            FileData::new(0, vec![0xAAu8; 524288]), /* 27C040 = 512KB */
+        )
         .unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire32B)).expect("build");
@@ -1562,10 +1554,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xBBu8; 524288], // SST39SF040 = 512KB
-        })
+        b.add_file(
+            FileData::new(0, vec![0xBBu8; 524288]), /* SST39SF040 = 512KB */
+        )
         .unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire32B)).expect("build");
@@ -1634,16 +1625,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 16384],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0x55u8; 16384],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 16384])).unwrap();
+        b.add_file(FileData::new(1, vec![0x55u8; 16384])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire28C)).expect("build");
         let v = view(&meta);
@@ -1723,11 +1706,7 @@ mod tests {
             );
 
             let mut b = v2_builder(&json);
-            b.add_file(FileData {
-                id: 0,
-                data: vec![0xAAu8; 524288],
-            })
-            .unwrap();
+            b.add_file(FileData::new(0, vec![0xAAu8; 524288])).unwrap();
 
             let (meta, rom) = b
                 .build(v2_props(Board::Fire32B))
@@ -1845,11 +1824,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire28C)).expect("build");
         let v = view(&meta);
@@ -1946,11 +1921,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xBBu8; 4096],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xBBu8; 4096])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire32B)).expect("build");
         let v = view(&meta);
@@ -2045,11 +2016,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xCCu8; 32768],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xCCu8; 32768])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire32B)).expect("build");
         let v = view(&meta);
@@ -2140,11 +2107,7 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
 
         let result = b.build(v2_props(Board::Fire32B));
 
@@ -2178,10 +2141,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 16384], // 27128 = 16KB
-        })
+        b.add_file(
+            FileData::new(0, vec![0xAAu8; 16384]), /* 27128 = 16KB */
+        )
         .unwrap();
 
         let result = b.build(v2_props(Board::Fire24A));
@@ -2216,10 +2178,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 65536], // 28C512 = 64KB
-        })
+        b.add_file(
+            FileData::new(0, vec![0xAAu8; 65536]), /* 28C512 = 64KB */
+        )
         .unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire28C)).expect("build");
@@ -2277,10 +2238,9 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 131072], // 27C010 = 128KB
-        })
+        b.add_file(
+            FileData::new(0, vec![0xAAu8; 131072]), /* 27C010 = 128KB */
+        )
         .unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire28C)).expect("build");
@@ -2339,11 +2299,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192], // 2764 = 8KB
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192]) /* 2764 = 8KB */)
+            .unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24A)).expect("build");
         let v = view(&meta);
@@ -2460,6 +2417,130 @@ mod tests {
     }
 
     // ========================================================================
+    // v2 multi mixed secondary chip types (2364 primary + 2332 secondary)
+    //
+    // The primary (chip[0]) is a 2364 with one control line (CS1); a 2332
+    // secondary has two (CS1 + CS2), with CS2 ignored because it is tied to a
+    // fixed level in the host machine (e.g. the C64 character ROM's CS2 -> 5V).
+    // Validation must accept such a set regardless of where the 2332 sits among
+    // the secondaries: `derive_multi_cs_config` anchors on chip[0], so ordering
+    // is irrelevant to how the set is served.
+    // ========================================================================
+
+    /// 2332 secondary in the *middle* (chip[1]). This is the ordering that
+    /// regressed in v0.7.0: the old check used chip[1] as its reference and
+    /// rejected the trailing 2364 for "differing" on CS2.
+    #[test]
+    fn check_cs_v2_multi_2332_secondary_middle_accepted() {
+        let json = r#"{
+            "version": 1,
+            "description": "2364 primary, 2332 secondary in the middle",
+            "chip_sets": [{
+                "type": "multi",
+                "chips": [
+                    { "file": "kernal.bin", "type": "2364", "cs1": "active_low" },
+                    { "file": "char.bin",   "type": "2332", "cs1": "active_low", "cs2": "ignore" },
+                    { "file": "basic.bin",  "type": "2364", "cs1": "active_low" }
+                ]
+            }]
+        }"#;
+        v2_builder(json); // must not panic — from_json must succeed
+    }
+
+    /// The same three chips with the 2332 secondary *last* (as shipped in
+    /// `onerom-config/set-c64.json`). Must remain accepted.
+    #[test]
+    fn check_cs_v2_multi_2332_secondary_last_accepted() {
+        let json = r#"{
+            "version": 1,
+            "description": "2364 primary, 2332 secondary last",
+            "chip_sets": [{
+                "type": "multi",
+                "chips": [
+                    { "file": "kernal.bin", "type": "2364", "cs1": "active_low" },
+                    { "file": "basic.bin",  "type": "2364", "cs1": "active_low" },
+                    { "file": "char.bin",   "type": "2332", "cs1": "active_low", "cs2": "ignore" }
+                ]
+            }]
+        }"#;
+        v2_builder(json); // must not panic — from_json must succeed
+    }
+
+    /// A secondary must have exactly one active control line. A 2332 secondary
+    /// that leaves CS2 active (rather than ignoring it) has two — its single
+    /// fly-lead cannot drive both, so this is rejected.
+    #[test]
+    fn check_cs_v2_multi_secondary_two_active_lines_rejected() {
+        let json = r#"{
+            "version": 1,
+            "description": "2332 secondary with CS2 active — invalid",
+            "chip_sets": [{
+                "type": "multi",
+                "chips": [
+                    { "file": "kernal.bin", "type": "2364", "cs1": "active_low" },
+                    { "file": "char.bin",   "type": "2332", "cs1": "active_low", "cs2": "active_low" }
+                ]
+            }]
+        }"#;
+        let err = Builder::from_json(FirmwareVersion::new(0, 7, 0, 0), McuFamily::Rp2350, json)
+            .expect_err("secondary with two active control lines must be rejected");
+        assert!(
+            err.to_string().contains("exactly one active control line"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// All secondaries must select on the same control line, because the deriver
+    /// reads only chip[1] to fix the per-chip select for the whole set. Here a
+    /// 27512 set has one secondary selecting on CE and another on OE.
+    #[test]
+    fn check_cs_v2_multi_secondaries_disagree_on_select_rejected() {
+        let json = r#"{
+            "version": 1,
+            "description": "27512 multi, secondaries select different lines — invalid",
+            "chip_sets": [{
+                "type": "multi",
+                "chips": [
+                    { "file": "a.bin", "type": "27512", "ce": "active_low", "oe": "active_low" },
+                    { "file": "b.bin", "type": "27512", "ce": "active_low", "oe": "ignore" },
+                    { "file": "c.bin", "type": "27512", "ce": "ignore", "oe": "active_low" }
+                ]
+            }]
+        }"#;
+        let err = Builder::from_json(FirmwareVersion::new(0, 7, 0, 0), McuFamily::Rp2350, json)
+            .expect_err("secondaries selecting different lines must be rejected");
+        assert!(
+            err.to_string().contains("same per-chip select line"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A secondary must have every control line the primary has. Here the
+    /// primary is a 2332 (CS1 + CS2) but a secondary is a 2364 (CS1 only): the
+    /// deriver would read the 2364's absent CS2 as active and misclassify it, so
+    /// this is rejected.
+    #[test]
+    fn check_cs_v2_multi_secondary_missing_primary_line_rejected() {
+        let json = r#"{
+            "version": 1,
+            "description": "2332 primary, 2364 secondary lacking CS2 — invalid",
+            "chip_sets": [{
+                "type": "multi",
+                "chips": [
+                    { "file": "a.bin", "type": "2332", "cs1": "active_low", "cs2": "active_low" },
+                    { "file": "b.bin", "type": "2364", "cs1": "active_low" }
+                ]
+            }]
+        }"#;
+        let err = Builder::from_json(FirmwareVersion::new(0, 7, 0, 0), McuFamily::Rp2350, json)
+            .expect_err("secondary lacking a primary control line must be rejected");
+        assert!(
+            err.to_string().contains("lacks control line"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ========================================================================
     // v2 multi 2-chip CS2-primary: Fire28C / 2x 23128
     // ========================================================================
 
@@ -2494,16 +2575,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 16384],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0xBBu8; 16384],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 16384])).unwrap();
+        b.add_file(FileData::new(1, vec![0xBBu8; 16384])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire28C)).expect("build");
         let v = view(&meta);
@@ -2594,16 +2667,8 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 8192],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0xBBu8; 8192],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 8192])).unwrap();
+        b.add_file(FileData::new(1, vec![0xBBu8; 8192])).unwrap();
 
         let (meta, _rom) = b.build(v2_props(Board::Fire24E)).expect("build");
         let v = view(&meta);
@@ -2669,21 +2734,10 @@ mod tests {
         }"#;
 
         let mut b = v2_builder(json);
-        b.add_file(FileData {
-            id: 0,
-            data: vec![0xAAu8; 2048], // 2316 = 2KB
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 1,
-            data: vec![0xBBu8; 2048],
-        })
-        .unwrap();
-        b.add_file(FileData {
-            id: 2,
-            data: vec![0xCCu8; 2048],
-        })
-        .unwrap();
+        b.add_file(FileData::new(0, vec![0xAAu8; 2048]) /* 2316 = 2KB */)
+            .unwrap();
+        b.add_file(FileData::new(1, vec![0xBBu8; 2048])).unwrap();
+        b.add_file(FileData::new(2, vec![0xCCu8; 2048])).unwrap();
 
         let (meta, rom) = b.build(v2_props(Board::Fire24F)).expect("build");
         let v = view(&meta);
@@ -2750,6 +2804,63 @@ mod tests {
                     .unwrap(),
                 "2316"
             );
+        }
+    }
+
+    // ========================================================================
+    // v2 flash-overflow guard: Fire32B / 16 x 27C010
+    // ========================================================================
+
+    /// The v2 builder must reject a config whose composed ROM data does not fit
+    /// the target board's flash — matching the guard the v1 builder has always
+    /// had. Sixteen 27C010 slots (each served 1:1 at 128KB, see
+    /// `v2_single_fire32b_27c010`) total 2MB, which exceeds the ROM space left
+    /// on the RP2350's 2MB flash after the firmware (48KB) and the metadata
+    /// region (16KB). Without the guard, `build()` would silently return an
+    /// over-large image; every consumer of the single onerom-gen `build()`
+    /// (CLI, the onerom-fw tool, Studio, one-rom-wasm) relies on this check.
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn v2_rejects_oversized_rom_data() {
+        const CHIP_BYTES: usize = 131_072; // 27C010 = 128KB, served 1:1
+        const SLOTS: usize = 16; // 16 * 128KB = 2MB > flash minus fw+metadata
+
+        let sets: Vec<String> = (0..SLOTS)
+            .map(|i| {
+                format!(
+                    r#"{{ "type": "single", "chips": [{{ "file": "f{i}.bin", "type": "27C010" }}] }}"#
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{ "version": 1, "description": "v2 flash overflow", "chip_sets": [{}] }}"#,
+            sets.join(",")
+        );
+
+        let mut b = v2_builder(&json);
+        for id in 0..SLOTS {
+            b.add_file(FileData::new(id, vec![0xAAu8; CHIP_BYTES]))
+                .unwrap();
+        }
+
+        let err = b
+            .build(v2_props(Board::Fire32B))
+            .expect_err("build must reject ROM data that overflows flash");
+
+        match err {
+            onerom_gen::Error::BufferTooSmall {
+                location,
+                expected,
+                actual,
+            } => {
+                assert_eq!(location, "Flash");
+                assert_eq!(expected, SLOTS * CHIP_BYTES);
+                assert!(
+                    expected > actual,
+                    "expected ROM data ({expected}) should exceed available flash ({actual})"
+                );
+            }
+            other => panic!("expected Error::BufferTooSmall, got {other:?}"),
         }
     }
 }

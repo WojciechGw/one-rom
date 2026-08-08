@@ -52,12 +52,12 @@
 //! [`parse_errors`]: ParsedDevice::parse_errors
 //! [`ParsedDevice::parse_device`]: crate::Parser::parse_device
 
-#[cfg(feature = "std")]
-use std::borrow::Cow;
 #[cfg(not(feature = "std"))]
 use alloc::borrow::Cow;
 #[cfg(not(feature = "std"))]
 use alloc::string::{String, ToString};
+#[cfg(feature = "std")]
+use std::borrow::Cow;
 
 use onerom_config::fw::FirmwareVersion;
 use onerom_config::hw::Board;
@@ -448,6 +448,11 @@ fn schema_slot_kind(slot: &OneromRomSlot) -> SlotKind {
         RomSlotType::RomSlotTypePluginSystem
         | RomSlotType::RomSlotTypePluginUser
         | RomSlotType::RomSlotTypePluginPio => SlotKind::Plugin,
-        _ => SlotKind::Rom,
+        // A RAM slot is user-placed and counted in the user-facing numbering,
+        // so it belongs here rather than with the plugins.
+        RomSlotType::RomSlotTypeSingleRom
+        | RomSlotType::RomSlotTypeBankedRom
+        | RomSlotType::RomSlotTypeMultiRom
+        | RomSlotType::RomSlotTypeSingleRam => SlotKind::Rom,
     }
 }

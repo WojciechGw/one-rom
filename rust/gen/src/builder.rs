@@ -3,31 +3,34 @@
 // MIT License
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
 use onerom_config::chip::ChipType;
 use onerom_config::fw::{FirmwareProperties, FirmwareVersion};
 use onerom_config::mcu::Family;
 use onerom_metadata::{
-    CURRENT_METADATA_VERSION, METADATA_BASE, METADATA_SIZE, ONEROM_METADATA_MAGIC,
-    OneromMetadataHeader, OneromRomInfo, OneromRomSlot, Pointer, RomSlotType, serialize,
+    CURRENT_METADATA_VERSION, MAX_SERIAL_NUMBER_LEN, MAX_UNIT_NAME_LEN, METADATA_BASE,
+    METADATA_SIZE, ONEROM_METADATA_MAGIC, OneromMetadataHeader, OneromRomInfo, OneromRomSlot,
+    Pointer, RomSlotType, serialize,
 };
 
+use crate::image::requires_half_select_cs1;
 use crate::v2::firmware_config::{build_firmware_config, build_firmware_overrides};
 use crate::v2::hardware_info::build_hardware_info;
 use crate::v2::rom_image::build_rom_image;
 use crate::v2::rom_info::truncate_filename;
 use crate::v2::rom_slot::build_rom_slot;
 use crate::{
-    Chip, ChipConfig, ChipSet, ChipSetType, Config, CsConfig, CsLogic, Error, FileData, FileSpec,
-    FireServeMode, License, MetadataWriter, Result,
+    Chip, ChipConfig, ChipSet, ChipSetType, Config, ConfigOverrides, ConfigWarning, CsConfig,
+    CsLogic, Error, FileData, FileSpec, FireServeMode, IHEX_BLANK_BYTE, License, MetadataWriter,
+    PAD_BLANK_BYTE, Result, SizeHandling,
 };
 use crate::{
-    FIRMWARE_SIZE, MAX_METADATA_LEN, MAX_SUPPORTED_FIRMWARE_VERSION_V1,
-    MAX_SUPPORTED_FIRMWARE_VERSION_V2, MIN_SUPPORTED_FIRMWARE_VERSION_V1,
-    MIN_SUPPORTED_FIRMWARE_VERSION_V2, Metadata, SUPPORTED_CHIP_TYPES_V1, SUPPORTED_CHIP_TYPES_V2,
-    UNSUPPORTED_FIRMWARE_VERSIONS_V1, UNSUPPORTED_FIRMWARE_VERSIONS_V2,
+    MAX_SUPPORTED_FIRMWARE_VERSION_V1, MAX_SUPPORTED_FIRMWARE_VERSION_V2,
+    MIN_SUPPORTED_FIRMWARE_VERSION_V1, MIN_SUPPORTED_FIRMWARE_VERSION_V2, Metadata,
+    SUPPORTED_CHIP_TYPES_V1, SUPPORTED_CHIP_TYPES_V2, UNSUPPORTED_FIRMWARE_VERSIONS_V1,
+    UNSUPPORTED_FIRMWARE_VERSIONS_V2,
 };
-use crate::image::requires_half_select_cs1;
 
 /// Main Builder object
 ///
@@ -90,10 +93,7 @@ use crate::image::requires_half_select_cs1;
 /// for spec in file_specs {
 ///     let data = fetch_file(&spec.source)?; // Your implementation
 ///     
-///     builder.add_file(FileData {
-///         id: spec.id,
-///         data,
-///     })?;
+///     builder.add_file(FileData::new(spec.id, data))?;
 /// }
 ///
 /// // Get config description (optional)
@@ -128,11 +128,39 @@ pub struct Builder {
 impl Builder {
     /// Create from JSON config
     ///
+    /// Every config check is enforced.  Use
+    /// [`Builder::from_json_with_overrides`] to accept specific ones.
+    ///
     /// Arguments:
     /// - `version`: Firmware version this config is for
     /// - `mcu_family`: MCU family this config is for
     /// - `json`: JSON string
     pub fn from_json(version: FirmwareVersion, mcu_family: Family, json: &str) -> Result<Self> {
+        // With no overrides set nothing is downgraded, so no warnings can be
+        // produced.
+        let (builder, _warnings) =
+            Self::from_json_with_overrides(version, mcu_family, json, &ConfigOverrides::default())?;
+
+        Ok(builder)
+    }
+
+    /// Create from JSON config, accepting the config checks named in
+    /// `overrides`
+    ///
+    /// Returns the builder, plus a [`ConfigWarning`] for each accepted check
+    /// that fired, for the caller to report as it sees fit.
+    ///
+    /// Arguments:
+    /// - `version`: Firmware version this config is for
+    /// - `mcu_family`: MCU family this config is for
+    /// - `json`: JSON string
+    /// - `overrides`: Config checks to accept rather than reject
+    pub fn from_json_with_overrides(
+        version: FirmwareVersion,
+        mcu_family: Family,
+        json: &str,
+        overrides: &ConfigOverrides,
+    ) -> Result<(Self, alloc::vec::Vec<ConfigWarning>)> {
         if version > MAX_SUPPORTED_FIRMWARE_VERSION_V2 {
             return Err(Error::FirmwareTooNew {
                 version,
@@ -142,11 +170,14 @@ impl Builder {
 
         let config: Config = serde_json::from_str(json)?;
 
-        if version >= MIN_SUPPORTED_FIRMWARE_VERSION_V2 {
-            validate_config_v2(&version, &mcu_family, &config)?;
+        // Only the v2 path has checks that can be accepted; the v1 path
+        // produces no warnings.
+        let warnings = if version >= MIN_SUPPORTED_FIRMWARE_VERSION_V2 {
+            validate_config_v2(&version, &mcu_family, &config, overrides)?
         } else {
             validate_config_v1(&version, &mcu_family, &config)?;
-        }
+            alloc::vec::Vec::new()
+        };
 
         let mut builder = Self {
             version,
@@ -158,7 +189,7 @@ impl Builder {
 
         build_file_id_map(&builder.config, &mut builder.file_id_map);
 
-        Ok(builder)
+        Ok((builder, warnings))
     }
 
     /// Get reference to config
@@ -263,22 +294,22 @@ impl Builder {
         &self,
         props: FirmwareProperties,
     ) -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
-        // Reject chip types the target board does not support. This is the same
-        // board-level test the CLI applies when parsing --slot, but here it is
-        // enforced unconditionally: V1 firmware genuinely cannot serve an
-        // unsupported chip type, so the CLI's --allow-unsupported-chip-type
-        // override deliberately has no effect on the V1 path. Plugin chip types
-        // are gated separately and skipped here.
+        // Reject chip types the target board does not support. V1 serves a
+        // fixed set per board, so this board-level test is the whole answer
+        // here - unlike V2, which derives what it can serve from the address
+        // and CS/data layouts. The CLI applies the same split to `--slot`,
+        // choosing the test by target firmware version. Plugin chip types are
+        // gated separately and skipped here.
         let board = props.board();
         for chip_set in self.config.chip_sets.iter() {
             for chip in chip_set.chips.iter() {
-                if chip.chip_type.is_plugin() {
+                if chip.chip_type.resolved().is_plugin() {
                     continue;
                 }
-                if !board.allows_chip_type(chip.chip_type) {
+                if !board.allows_chip_type(chip.chip_type.resolved()) {
                     return Err(Error::UnsupportedBoardChipType {
                         board,
-                        chip_type: chip.chip_type,
+                        chip_type: chip.chip_type.resolved(),
                     });
                 }
             }
@@ -295,7 +326,7 @@ impl Builder {
                     return Err(Error::InvalidConfig {
                         error: "Fire CPU serving mode is only supported on One ROM 24".to_string(),
                     });
-                } else if chip_set_config.chips[0].chip_type == ChipType::Chip28C16 {
+                } else if chip_set_config.chips[0].chip_type.resolved() == ChipType::Chip28C16 {
                     return Err(Error::InvalidConfig {
                         error: "Fire CPU serving mode is not supported with 28C16".to_string(),
                     });
@@ -320,9 +351,7 @@ impl Builder {
         let set_count = metadata.total_set_count();
 
         // Check the board has enough space
-        let mcu_variant = props.mcu_variant();
-        let flash_size = mcu_variant.flash_storage_bytes();
-        let rom_space = flash_size - FIRMWARE_SIZE - MAX_METADATA_LEN;
+        let rom_space = crate::rom_data_space(props.mcu_variant());
         assert!(rom_space > 0);
 
         // Figure out the ROM data size
@@ -351,6 +380,7 @@ impl Builder {
     }
 
     /// v2 (0.7.0+, RP2350, PIO-only) metadata/ROM image build
+    #[allow(clippy::wildcard_enum_match_arm)]
     fn build_v2(
         &self,
         props: FirmwareProperties,
@@ -378,7 +408,7 @@ impl Builder {
                     data: Pointer::Null,
                     size: chip.data().map(|d| d.len() as u32).unwrap_or(0),
                     roms: alloc::vec![OneromRomInfo {
-                        rom_type: chip.chip_type().name().to_string(),
+                        rom_type: chip.chip_type_raw().to_string(),
                         filename: truncate_filename(chip.filename()),
                         pin_map: None,
                         chip_size: chip.chip_type().size_bytes() as u32,
@@ -418,7 +448,23 @@ impl Builder {
             rom_data_offset += slot.size;
         }
 
-        let mut rom_data_buf = alloc::vec::Vec::with_capacity(rom_data_offset as usize);
+        // Check the ROM data fits in the flash left after the firmware and the
+        // fixed-size metadata region. This mirrors the V1 guard so that every
+        // caller of `build()` - CLI, the onerom-fw tool, Studio, and the
+        // web programmer via one-rom-wasm - gets the check from the single
+        // onerom-gen implementation, rather than each having to re-run the
+        // downstream `onerom-fw::validate_sizes` themselves.
+        let rom_data_size = rom_data_offset as usize;
+        let rom_space = crate::rom_data_space(props.mcu_variant());
+        if rom_data_size > rom_space {
+            return Err(Error::BufferTooSmall {
+                location: "Flash",
+                expected: rom_data_size,
+                actual: rom_space,
+            });
+        }
+
+        let mut rom_data_buf = alloc::vec::Vec::with_capacity(rom_data_size);
         for ((chip_set, slot), layout) in chip_sets.iter().zip(rom_slots.iter()).zip(layouts.iter())
         {
             let image = match layout {
@@ -530,6 +576,18 @@ pub(crate) fn build_file_id_map(config: &Config, file_id_map: &mut BTreeMap<usiz
     }
 }
 
+// Whether any of this tool's builders can serve `chip_type` on `mcu_family`.
+//
+// A chip type declaring a `supported` firmware version in `chip-types.json` is
+// not necessarily one a builder implements: 62256 is declared for its name,
+// pinout and RBCP type alone.  So membership of a builder's list, rather than
+// the declared version, is what says the tool can serve the chip.  V2 exists
+// only for the RP2350, so an STM32 target can only be served by V1.
+fn chip_type_servable_by_tool(chip_type: ChipType, mcu_family: &Family) -> bool {
+    SUPPORTED_CHIP_TYPES_V1.contains(&chip_type)
+        || (*mcu_family == Family::Rp2350 && SUPPORTED_CHIP_TYPES_V2.contains(&chip_type))
+}
+
 // Returns number of non-plugin ROM slots.
 // Validates structural constraints only — chip counts, firmware version
 // compatibility, file specs, plugin rules.  CS/CE/OE validation is handled
@@ -593,30 +651,51 @@ pub(crate) fn check_chip_sets(
             let chip0 = &set.chips[0];
 
             // Check chip_type is supported
-            if !supported_chip_types.contains(&chip.chip_type) {
+            if !supported_chip_types.contains(&chip.chip_type.resolved()) {
+                // The builder for the target firmware cannot serve this chip
+                // type, but another generation of builder may be able to - a
+                // 23C1001 needs V2, so a V1 target lands here.  Where that is
+                // the case, and the target firmware simply predates the chip
+                // type, name the firmware version required instead of claiming
+                // the tool does not know the chip at all.  Gated on the other
+                // builder being reachable for this MCU, so an STM32 build is
+                // not pointed at a firmware version that will only ever exist
+                // for the RP2350.
+                if let Some(min_version) =
+                    chip.chip_type.resolved().min_supported_firmware_version()
+                    && version < &min_version
+                    && chip_type_servable_by_tool(chip.chip_type.resolved(), mcu_family)
+                {
+                    return Err(Error::FirmwareTooOld {
+                        feat: chip.chip_type.resolved().name(),
+                        version: *version,
+                        minimum: min_version,
+                    });
+                }
                 return Err(Error::UnsupportedToolChipType {
-                    chip_type: chip.chip_type,
+                    chip_type: chip.chip_type.resolved(),
                 });
             }
 
             // Check chip type is supported for this version of firmware
-            if let Some(min_version) = chip.chip_type.min_supported_firmware_version() {
+            if let Some(min_version) = chip.chip_type.resolved().min_supported_firmware_version() {
                 if version < &min_version {
                     return Err(Error::FirmwareTooOld {
-                        feat: chip.chip_type.name(),
+                        feat: chip.chip_type.resolved().name(),
                         version: *version,
                         minimum: min_version,
                     });
                 }
             } else {
                 return Err(Error::UnsupportedToolChipType {
-                    chip_type: chip.chip_type,
+                    chip_type: chip.chip_type.resolved(),
                 });
             }
 
             // Check filename specified for ROMs
             if chip.file.is_empty()
-                && chip.chip_type.chip_function() != onerom_config::chip::ChipFunction::Ram
+                && chip.chip_type.resolved().chip_function()
+                    != onerom_config::chip::ChipFunction::Ram
             {
                 return Err(Error::InvalidConfig {
                     error: format!("Chip {} file name is empty", chip_num),
@@ -624,12 +703,14 @@ pub(crate) fn check_chip_sets(
             }
 
             // Check all Chips in a bank are same type
-            if set.set_type == ChipSetType::Banked && chip.chip_type != chip0.chip_type {
+            if set.set_type == ChipSetType::Banked
+                && chip.chip_type.resolved() != chip0.chip_type.resolved()
+            {
                 return Err(Error::InvalidConfig {
                     error: format!(
                         "All Chips in a banked set must be of the same type ({} != {})",
-                        chip.chip_type.name(),
-                        chip0.chip_type.name()
+                        chip.chip_type.resolved().name(),
+                        chip0.chip_type.resolved().name()
                     ),
                 });
             }
@@ -650,7 +731,7 @@ pub(crate) fn check_chip_sets(
             }
 
             // Check for plugins on Ice (not supported)
-            if chip.chip_type.is_plugin() {
+            if chip.chip_type.resolved().is_plugin() {
                 if matches!(mcu_family, Family::Stm32f4) {
                     return Err(Error::InvalidConfig {
                         error: format!("Plugins are not supported on Ice (Chip {})", chip_num),
@@ -659,18 +740,18 @@ pub(crate) fn check_chip_sets(
                 is_plugin = true;
             }
 
-            if chip.chip_type == ChipType::SystemPlugin && set_id != 0 {
+            if chip.chip_type.resolved() == ChipType::SystemPlugin && set_id != 0 {
                 return Err(Error::InvalidConfig {
                     error: "System plugins must be in the first slot".to_string(),
                 });
             }
-            if chip.chip_type == ChipType::UserPlugin {
+            if chip.chip_type.resolved() == ChipType::UserPlugin {
                 if set_id != 1 {
                     return Err(Error::InvalidConfig {
                         error: "User plugins must be in the second slot".to_string(),
                     });
                 } else {
-                    if config.chip_sets[0].chips[0].chip_type != ChipType::SystemPlugin {
+                    if config.chip_sets[0].chips[0].chip_type.resolved() != ChipType::SystemPlugin {
                         return Err(Error::InvalidConfig {
                             error: "User plugins must be in the second slot, and the first slot must be a system plugin".to_string()
                         });
@@ -698,7 +779,7 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
     for set in config.chip_sets.iter() {
         for chip in set.chips.iter() {
             // Check that required CS lines are specified
-            for line in chip.chip_type.control_lines() {
+            for line in chip.chip_type.resolved().control_lines() {
                 let cs = match line.name {
                     "cs1" => chip.cs1,
                     "cs2" => chip.cs2,
@@ -714,7 +795,7 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
                 };
                 if cs.is_none() {
                     return Err(Error::MissingCsConfig {
-                        chip_type: chip.chip_type,
+                        chip_type: chip.chip_type.resolved(),
                         line: line.name,
                     });
                 }
@@ -723,11 +804,13 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
             // Check that invalid CS lines are NOT specified
             let has_cs2 = chip
                 .chip_type
+                .resolved()
                 .control_lines()
                 .iter()
                 .any(|line| line.name == "cs2");
             let has_cs3 = chip
                 .chip_type
+                .resolved()
                 .control_lines()
                 .iter()
                 .any(|line| line.name == "cs3");
@@ -736,7 +819,7 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
                 return Err(Error::InvalidConfig {
                     error: format!(
                         "CS2 specified for Chip type {} which does not use CS2",
-                        chip.chip_type.name()
+                        chip.chip_type.resolved().name()
                     ),
                 });
             }
@@ -744,7 +827,7 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
                 return Err(Error::InvalidConfig {
                     error: format!(
                         "CS3 specified for Chip type {} which does not use CS3",
-                        chip.chip_type.name()
+                        chip.chip_type.resolved().name()
                     ),
                 });
             }
@@ -769,6 +852,7 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
             // Check that the correct CS lines are specified for the Chip type
             let mut required_cs_lines: BTreeSet<&str> = chip
                 .chip_type
+                .resolved()
                 .control_lines()
                 .iter()
                 .filter(|line| matches!(line.name, "cs1" | "cs2" | "cs3"))
@@ -776,7 +860,7 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
                 .collect();
             // V1 special case: 27C080 has no CS lines but we treat A19 as CS1
             // so it can switch between two One ROMs each serving half.
-            if chip.chip_type == ChipType::Chip27C080 {
+            if chip.chip_type.resolved() == ChipType::Chip27C080 {
                 required_cs_lines.insert("cs1");
             }
 
@@ -798,7 +882,7 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
                 return Err(Error::InvalidConfig {
                     error: format!(
                         "Chip type {} requires CS lines {:?}, but specified CS lines are {:?}",
-                        chip.chip_type.name(),
+                        chip.chip_type.resolved().name(),
                         required_cs_lines,
                         specified_cs_lines
                     ),
@@ -811,7 +895,7 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
                     return Err(Error::InvalidConfig {
                         error: format!(
                             "Chip type {} does not use {}, but it is specified",
-                            chip.chip_type.name(),
+                            chip.chip_type.resolved().name(),
                             line
                         ),
                     });
@@ -896,7 +980,6 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
     Ok(())
 }
 
-
 /// V2 CS/CE/OE validation.
 ///
 /// Handles:
@@ -910,37 +993,39 @@ pub(crate) fn check_cs_v1(config: &Config) -> Result<()> {
 /// - Polarity consistency across chips in multi/banked sets
 pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
     use onerom_config::chip::ControlLineType;
- 
+
     for (set_id, set) in config.chip_sets.iter().enumerate() {
         // Plugin sets have no CS lines — skip
-        if set.chips.iter().all(|c| c.chip_type.is_plugin()) {
+        if set.chips.iter().all(|c| c.chip_type.resolved().is_plugin()) {
             continue;
         }
- 
+
         for (chip_idx, chip) in set.chips.iter().enumerate() {
-            if chip.chip_type.is_plugin() {
+            if chip.chip_type.resolved().is_plugin() {
                 continue;
             }
- 
+
             let is_multi_secondary = set.set_type == ChipSetType::Multi && chip_idx > 0;
- 
+
             // ---- ce/oe fields only valid for chip types that have those lines ----
             let has_ce = chip
                 .chip_type
+                .resolved()
                 .control_lines()
                 .iter()
                 .any(|l| l.name == "ce");
             let has_oe = chip
                 .chip_type
+                .resolved()
                 .control_lines()
                 .iter()
                 .any(|l| l.name == "oe");
- 
+
             if chip.ce.is_some() && !has_ce {
                 return Err(Error::InvalidConfig {
                     error: format!(
                         "ce specified for chip type {} which has no /CE line (set {}, chip {})",
-                        chip.chip_type.name(),
+                        chip.chip_type.resolved().name(),
                         set_id,
                         chip_idx
                     ),
@@ -950,13 +1035,13 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                 return Err(Error::InvalidConfig {
                     error: format!(
                         "oe specified for chip type {} which has no /OE line (set {}, chip {})",
-                        chip.chip_type.name(),
+                        chip.chip_type.resolved().name(),
                         set_id,
                         chip_idx
                     ),
                 });
             }
- 
+
             // ---- Both CE and OE may not both be Ignore ----
             let ce_logic = chip.ce.unwrap_or(CsLogic::ActiveLow);
             let oe_logic = chip.oe.unwrap_or(CsLogic::ActiveLow);
@@ -965,13 +1050,13 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                     error: format!(
                         "Both CE and OE cannot be Ignore simultaneously for chip type {} \
                          (set {}, chip {})",
-                        chip.chip_type.name(),
+                        chip.chip_type.resolved().name(),
                         set_id,
                         chip_idx
                     ),
                 });
             }
- 
+
             // ---- Validate each CS line against the chip type ----
             //
             // A CS line's polarity is either mask-programmed at manufacture
@@ -987,22 +1072,23 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
             // not a pin. Derived from the chip type's address line count
             // rather than named explicitly, so any future oversized chip type
             // works without touching this. See `requires_half_select_cs1`.
-            let half_select_cs1 = requires_half_select_cs1(&chip.chip_type);
+            let half_select_cs1 = requires_half_select_cs1(&chip.chip_type.resolved());
             let cs_values = [
                 ("cs1", chip.cs1),
                 ("cs2", chip.cs2),
                 ("cs3", chip.cs3),
                 ("cs4", chip.cs4),
             ];
- 
+
             for (name, user) in cs_values {
                 let spec = chip
                     .chip_type
+                    .resolved()
                     .control_lines()
                     .iter()
                     .find(|l| l.name == name);
                 let virtual_cs1 = half_select_cs1 && name == "cs1";
- 
+
                 match (spec, user) {
                     // Line the chip doesn't have.
                     (None, Some(_)) if !virtual_cs1 => {
@@ -1011,7 +1097,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                                 "{} specified for chip type {} which does not use it \
                                  (set {}, chip {})",
                                 name.to_uppercase(),
-                                chip.chip_type.name(),
+                                chip.chip_type.resolved().name(),
                                 set_id,
                                 chip_idx
                             ),
@@ -1023,7 +1109,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                             error: format!(
                                 "Chip type {} requires cs1 (the half-select) to be \
                                  specified (set {}, chip {})",
-                                chip.chip_type.name(),
+                                chip.chip_type.resolved().name(),
                                 set_id,
                                 chip_idx
                             ),
@@ -1035,7 +1121,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                             error: format!(
                                 "Chip type {} requires configurable CS line {} to be \
                                  specified (set {}, chip {})",
-                                chip.chip_type.name(),
+                                chip.chip_type.resolved().name(),
                                 name,
                                 set_id,
                                 chip_idx
@@ -1053,7 +1139,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                                  configured; only 'ignore' may be specified \
                                  (set {}, chip {})",
                                 name.to_uppercase(),
-                                chip.chip_type.name(),
+                                chip.chip_type.resolved().name(),
                                 set_id,
                                 chip_idx
                             ),
@@ -1062,7 +1148,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                     _ => {}
                 }
             }
- 
+
             // ---- Ignore permission check ----
             //
             // Ignore is implicitly permitted:
@@ -1081,6 +1167,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                 // (b) per-line allow_ignore in chip_types.json
                 let line_spec = chip
                     .chip_type
+                    .resolved()
                     .control_lines()
                     .iter()
                     .find(|l| l.name == line_name);
@@ -1098,13 +1185,13 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                          bus contention — set allow_cs_ignore: true to confirm this is \
                          intentional.",
                         line_name.to_uppercase(),
-                        chip.chip_type.name(),
+                        chip.chip_type.resolved().name(),
                         set_id,
                         chip_idx
                     ),
                 })
             };
- 
+
             for (name, user) in cs_values {
                 if let Some(logic) = user {
                     check_ignore(name, logic)?;
@@ -1116,7 +1203,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
             if has_oe {
                 check_ignore("oe", oe_logic)?;
             }
- 
+
             // ---- CS ordering rules for configurable-CS chips ----
             // When allow_cs_ignore is NOT set, the natural expectation is that
             // CS lines are used from CS1 outward — e.g. CS1 only, or CS1+CS2,
@@ -1128,13 +1215,13 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                 let cs2_active = chip.cs2.is_some_and(|l| l != CsLogic::Ignore);
                 let cs3_active = chip.cs3.is_some_and(|l| l != CsLogic::Ignore);
                 let cs4_active = chip.cs4.is_some_and(|l| l != CsLogic::Ignore);
- 
+
                 if !cs1_active && (cs2_active || cs3_active || cs4_active) {
                     return Err(Error::InvalidConfig {
                         error: alloc::format!(
                             "CS1 cannot be Ignore when CS2, CS3 or CS4 are active for chip \
                              type {} (set {}, chip {}) unless allow_cs_ignore is set",
-                            chip.chip_type.name(),
+                            chip.chip_type.resolved().name(),
                             set_id,
                             chip_idx
                         ),
@@ -1145,7 +1232,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                         error: alloc::format!(
                             "CS2 cannot be Ignore when CS3 or CS4 are active for chip type {} \
                              (set {}, chip {}) unless allow_cs_ignore is set",
-                            chip.chip_type.name(),
+                            chip.chip_type.resolved().name(),
                             set_id,
                             chip_idx
                         ),
@@ -1156,7 +1243,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                         error: alloc::format!(
                             "CS3 cannot be Ignore when CS4 is active for chip type {} \
                              (set {}, chip {}) unless allow_cs_ignore is set",
-                            chip.chip_type.name(),
+                            chip.chip_type.resolved().name(),
                             set_id,
                             chip_idx
                         ),
@@ -1164,23 +1251,28 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                 }
             }
         }
- 
+
         // ---- Multi set consistency validation ----
         //
-        // For Multi sets with chips having N > 1 control lines, chips[1+]
-        // must each have exactly 1 active line (the per-chip select, fly-leaded
-        // to X1/X2) and ignore the remaining N-1 (the commoned lines). All
-        // chips[1+] must ignore the same set of lines. Chip[0] must not ignore
-        // its per-chip select line.
+        // A Multi set serves several chips through One ROM's per-chip select
+        // mechanism: chip[0] (the primary) sits in the socket and is served via
+        // its own control lines; chips[1+] (the secondaries) are each fly-leaded
+        // to an X header pin by a single select line.
         //
-        // Only the Ignore/not-Ignore distinction matters here, so the
-        // ActiveLow default used for unspecified lines is safe even where the
-        // real polarity is fixed active-high (the line is active either way).
+        // `derive_multi_cs_config` (v2::multi_cs_config) builds the serving
+        // config from chip[0]'s control lines — the set's line "universe" — then
+        // reads chips[1]'s logic to pick which of those lines is the per-chip
+        // select and to classify chip[0]'s remaining lines as commoned (active on
+        // chip[0] too) or ignored. This validation mirrors that model so it
+        // accepts exactly the sets the deriver can serve; anchoring on chip[0]
+        // (not chip[1]) makes the result independent of secondary ordering.
+        //
+        // Only the Ignore/not-Ignore distinction matters here, so the ActiveLow
+        // default used for unspecified lines is safe even where the real polarity
+        // is fixed active-high (the line is active either way).
         if set.set_type == ChipSetType::Multi && set.chips.len() >= 2 {
-            let chip1 = &set.chips[1];
-            let chip_type = chip1.chip_type;
-            let control_lines = chip_type.control_lines();
- 
+            let is_control =
+                |name: &str| matches!(name, "ce" | "oe" | "cs1" | "cs2" | "cs3" | "cs4");
             let line_logic = |chip: &ChipConfig, name: &str| -> CsLogic {
                 match name {
                     "ce" => chip.ce.unwrap_or(CsLogic::ActiveLow),
@@ -1192,74 +1284,124 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
                     _ => CsLogic::ActiveLow,
                 }
             };
- 
-            // Collect (name, logic) for all control lines of chips[1],
-            // using defaults (ActiveLow) for unspecified lines.
-            let line_logics: alloc::vec::Vec<(&str, CsLogic)> = control_lines
-                .iter()
-                .filter(|l| matches!(l.name, "ce" | "oe" | "cs1" | "cs2" | "cs3" | "cs4"))
-                .map(|l| (l.name, line_logic(chip1, l.name)))
-                .collect();
- 
-            let num_lines = line_logics.len();
-            let active: alloc::vec::Vec<&str> = line_logics
-                .iter()
-                .filter(|(_, l)| *l != CsLogic::Ignore)
-                .map(|(n, _)| *n)
-                .collect();
- 
-            // For single-line chips, no ignores needed.
-            if num_lines > 1 && active.len() != 1 {
-                return Err(Error::InvalidConfig {
-                    error: alloc::format!(
-                        "Multi set secondary chips must have exactly 1 active control line \
-                         (the per-chip select) and ignore the rest. Chip type {} (set {}) \
-                         has {} active lines: {:?}",
-                        chip_type.name(),
-                        set_id,
-                        active.len(),
-                        active
-                    ),
-                });
-            }
- 
-            // All chips[1+] must agree on which lines are active/ignored.
-            for (idx, chip) in set.chips.iter().enumerate().skip(2) {
-                for &(name, ref_logic) in &line_logics {
-                    let chip_is_ignore = line_logic(chip, name) == CsLogic::Ignore;
-                    let ref_is_ignore = ref_logic == CsLogic::Ignore;
-                    if chip_is_ignore != ref_is_ignore {
-                        return Err(Error::InvalidConfig {
-                            error: alloc::format!(
-                                "Multi set secondary chips must all ignore the same control \
-                                 lines. Chip {} (set {}, chip {}) differs from chip 1 on \
-                                 line '{}'",
-                                chip_type.name(),
-                                set_id,
-                                idx,
-                                name
-                            ),
-                        });
-                    }
-                }
-            }
- 
-            // Chip[0] must not ignore the per-chip select line.
-            if let Some(&per_chip_select_name) = active.first() {
-                let chip0 = &set.chips[0];
-                if line_logic(chip0, per_chip_select_name) == CsLogic::Ignore {
+            let control_names = |chip: &ChipConfig| -> alloc::vec::Vec<&'static str> {
+                chip.chip_type
+                    .resolved()
+                    .control_lines()
+                    .iter()
+                    .map(|l| l.name)
+                    .filter(|n| is_control(n))
+                    .collect()
+            };
+
+            // chip[0]'s control lines are the set's line universe (matching
+            // derive_multi_cs_config).
+            let chip0 = &set.chips[0];
+            let chip0_name = chip0.chip_type.resolved().name();
+            let universe = control_names(chip0);
+            let mut set_select: Option<&str> = None;
+
+            for (idx, chip) in set.chips.iter().enumerate().skip(1) {
+                let chip_name = chip.chip_type.resolved().name();
+                let own = control_names(chip);
+
+                // (1) A secondary is fly-leaded by exactly one select line; every
+                //     other control line it has must be ignored.
+                let active: alloc::vec::Vec<&str> = own
+                    .iter()
+                    .copied()
+                    .filter(|&n| line_logic(chip, n) != CsLogic::Ignore)
+                    .collect();
+                if active.len() != 1 {
                     return Err(Error::InvalidConfig {
                         error: alloc::format!(
-                            "Multi set chip 0 cannot ignore '{}', which is the per-chip \
-                             select line for this set (set {})",
-                            per_chip_select_name,
-                            set_id
+                            "Multi set secondary chips must have exactly one active control \
+                             line (the per-chip select) and ignore the rest. Chip {} (set {}, \
+                             chip {}) has {} active lines: {:?}",
+                            chip_name,
+                            set_id,
+                            idx,
+                            active.len(),
+                            active
                         ),
                     });
                 }
+                let select = active[0];
+
+                // (2) The select line must be one chip[0] also has: the deriver
+                //     builds the CS layout from chip[0]'s control lines.
+                if !universe.contains(&select) {
+                    return Err(Error::InvalidConfig {
+                        error: alloc::format!(
+                            "Multi set secondary chip {} (set {}, chip {}) selects on control \
+                             line '{}', which the primary chip {} does not have",
+                            chip_name,
+                            set_id,
+                            idx,
+                            select,
+                            chip0_name
+                        ),
+                    });
+                }
+
+                // (3) The secondary must have every line chip[0] has, or the
+                //     deriver — which reads each of chip[0]'s lines on the
+                //     secondary — would treat a line the secondary's type lacks
+                //     (defaulted active, not Ignore) as a second select.
+                if let Some(missing) = universe.iter().copied().find(|u| !own.contains(u)) {
+                    return Err(Error::InvalidConfig {
+                        error: alloc::format!(
+                            "Multi set secondary chip {} (set {}, chip {}) lacks control line \
+                             '{}', which the primary chip {} has; a secondary must have every \
+                             control line of the primary",
+                            chip_name,
+                            set_id,
+                            idx,
+                            missing,
+                            chip0_name
+                        ),
+                    });
+                }
+
+                // (4) All secondaries must select the same line: the deriver
+                //     reads only chip[1] to fix the set's per-chip select.
+                match set_select {
+                    None => set_select = Some(select),
+                    Some(first) if first != select => {
+                        return Err(Error::InvalidConfig {
+                            error: alloc::format!(
+                                "Multi set secondary chips must all use the same per-chip \
+                                 select line. Chip {} (set {}, chip {}) selects on '{}', but an \
+                                 earlier secondary selects on '{}'",
+                                chip_name,
+                                set_id,
+                                idx,
+                                select,
+                                first
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            // (5) chip[0] must not ignore the per-chip select line: that line is
+            //     chip[0]'s own primary CS.
+            if let Some(select) = set_select
+                && line_logic(chip0, select) == CsLogic::Ignore
+            {
+                return Err(Error::InvalidConfig {
+                    error: alloc::format!(
+                        "Multi set primary chip {} (set {}) must not ignore '{}', the per-chip \
+                         select line for this set",
+                        chip0_name,
+                        set_id,
+                        select
+                    ),
+                });
             }
         }
- 
+
         // ---- CS polarity consistency for Banked sets only ----
         //
         // All chips in a Banked set share the same physical CS line on the board,
@@ -1283,7 +1425,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
             }
         }
     }
- 
+
     Ok(())
 }
 
@@ -1294,6 +1436,7 @@ pub(crate) fn check_cs_v2(config: &Config) -> Result<()> {
 pub(crate) fn cs_primary_polarity(chip: &ChipConfig) -> Option<CsLogic> {
     let has_ce = chip
         .chip_type
+        .resolved()
         .control_lines()
         .iter()
         .any(|l| l.name == "ce");
@@ -1334,8 +1477,10 @@ pub(crate) fn file_specs(
                     source: rom.file.clone(),
                     extract: rom.extract.clone(),
                     size_handling: rom.size_handling.clone(),
-                    chip_type: rom.chip_type,
-                    rom_size: rom.chip_type.size_bytes(),
+                    format: rom.format,
+                    load_address: rom.load_address,
+                    chip_type: rom.chip_type.resolved(),
+                    rom_size: rom.chip_type.resolved().size_bytes(),
                     cs1: rom.cs1,
                     cs2: rom.cs2,
                     cs3: rom.cs3,
@@ -1557,7 +1702,7 @@ pub(crate) fn validate_plugins(
     for set in config.chip_sets.iter() {
         for rom in set.chips.iter() {
             if matches!(
-                rom.chip_type,
+                rom.chip_type.resolved(),
                 ChipType::SystemPlugin | ChipType::UserPlugin | ChipType::PioPlugin
             ) {
                 let file_id = file_id_map.get(&rom_id).unwrap();
@@ -1565,7 +1710,7 @@ pub(crate) fn validate_plugins(
 
                 if data.len() < 256 {
                     return Err(Error::InvalidPluginImage {
-                        plugin_type: rom.chip_type,
+                        plugin_type: rom.chip_type.resolved(),
                         image_file: rom.file.clone(),
                         error:
                             "Plugin image is smaller than the required plugin header (256 bytes)."
@@ -1575,7 +1720,7 @@ pub(crate) fn validate_plugins(
 
                 if &data[0..4] != b"ORA " {
                     return Err(Error::InvalidPluginImage {
-                        plugin_type: rom.chip_type,
+                        plugin_type: rom.chip_type.resolved(),
                         image_file: rom.file.clone(),
                         error: "Invalid magic value in plugin header.".to_string(),
                     });
@@ -1583,7 +1728,7 @@ pub(crate) fn validate_plugins(
                 let api_version = u32::from_le_bytes(data[4..8].try_into().unwrap());
                 if api_version != 1 {
                     return Err(Error::InvalidPluginImage {
-                        plugin_type: rom.chip_type,
+                        plugin_type: rom.chip_type.resolved(),
                         image_file: rom.file.clone(),
                         error: format!(
                             "Invalid API version {api_version} in plugin header - must be 1."
@@ -1599,7 +1744,7 @@ pub(crate) fn validate_plugins(
 
                 if plugin_fw_version > props.version() {
                     return Err(Error::InvalidPluginImage {
-                        plugin_type: rom.chip_type,
+                        plugin_type: rom.chip_type.resolved(),
                         image_file: rom.file.clone(),
                         error: format!(
                             "Plugin requires at least firmware version {} which is newer than \
@@ -1641,6 +1786,36 @@ pub(crate) fn build_chip_sets(
                 None
             };
 
+            // A load address is only meaningful for an Intel HEX image.
+            if chip_config.format.is_binary() && !chip_config.load_address.is_zero() {
+                return Err(Error::LoadAddressWithoutIhex { index: chip_id });
+            }
+
+            // Decode Intel HEX up front so `from_raw_rom_image` still receives a
+            // flat binary image; its own SizeHandling then reconciles the
+            // decoded image against the chip size (padding with 0xFF rather than
+            // the raw-binary 0xAA).  Duplicate has no meaning for an
+            // address-placed image.
+            let (source, blank_byte) = match (chip_config.format, data) {
+                (crate::FileFormat::IntelHex, Some(raw)) => {
+                    if matches!(chip_config.size_handling, SizeHandling::Duplicate) {
+                        return Err(Error::IhexDuplicateUnsupported { index: chip_id });
+                    }
+                    let decoded = crate::ihex::decode_ihex(raw, chip_config.load_address.0)
+                        .map_err(|source| Error::IntelHex {
+                            index: chip_id,
+                            source,
+                        })?;
+                    (Some(decoded), IHEX_BLANK_BYTE)
+                }
+                _ => (None, PAD_BLANK_BYTE),
+            };
+            // Borrow the decoded image if present, otherwise the raw file bytes.
+            let source: Option<&[u8]> = match &source {
+                Some(decoded) => Some(decoded.as_slice()),
+                None => data.map(|v| &**v),
+            };
+
             let filename = chip_config.filename();
 
             // Resolve the chip's control line configuration against its chip
@@ -1648,7 +1823,7 @@ pub(crate) fn build_chip_sets(
             // silicon, configurable ones from the user, and chip types with no
             // CS lines at all fall through to CE/OE.
             let cs_config = CsConfig::from_chip_type(
-                &chip_config.chip_type,
+                &chip_config.chip_type.resolved(),
                 chip_config.cs1,
                 chip_config.cs2,
                 chip_config.cs3,
@@ -1661,12 +1836,14 @@ pub(crate) fn build_chip_sets(
                 chip_id,
                 filename,
                 chip_config.label.clone(),
-                data.map(|v| &**v),
-                alloc::vec![0u8; chip_config.chip_type.size_bytes()],
+                source,
+                alloc::vec![0u8; chip_config.chip_type.resolved().size_bytes()],
                 &chip_config.chip_type,
                 cs_config,
                 &chip_config.size_handling,
+                blank_byte,
                 chip_config.location,
+                &chip_config.transform,
             )?;
             set_roms.push(rom);
             chip_id += 1;
@@ -1746,7 +1923,7 @@ fn validate_config_v1(
     if *version < MIN_FW_CHIP_TYPE_231024 {
         for set in config.chip_sets.iter() {
             for chip in set.chips.iter() {
-                if matches!(chip.chip_type, ChipType::Chip231024) {
+                if matches!(chip.chip_type.resolved(), ChipType::Chip231024) {
                     return Err(Error::FirmwareTooOld {
                         feat: "231024 ROMs",
                         version: *version,
@@ -1783,11 +1960,16 @@ fn validate_config_v1(
     Ok(())
 }
 
+/// Validate a config against v2 (firmware v0.7.0+) rules.
+///
+/// Returns a [`ConfigWarning`] for each check `overrides` accepts and which
+/// fired; any other failure is an error.
 fn validate_config_v2(
     version: &FirmwareVersion,
     mcu_family: &Family,
     config: &Config,
-) -> Result<()> {
+    overrides: &ConfigOverrides,
+) -> Result<alloc::vec::Vec<ConfigWarning>> {
     if !matches!(mcu_family, Family::Rp2350) {
         return Err(Error::UnsupportedMcuFamily {
             family: *mcu_family,
@@ -1802,6 +1984,34 @@ fn validate_config_v2(
         UNSUPPORTED_FIRMWARE_VERSIONS_V2,
         "v0.7.0+ firmware",
     )?;
+
+    // Device-level metadata strings are stored verbatim in flash; reject
+    // over-long values here, up front, rather than silently truncating them
+    // when the metadata is built.
+    if let Some(name) = &config.instance_name
+        && name.len() > MAX_UNIT_NAME_LEN
+    {
+        return Err(Error::InvalidConfig {
+            error: format!(
+                "instance_name is too long: {} bytes, but the maximum is {}. \
+                 Please shorten the unit name.",
+                name.len(),
+                MAX_UNIT_NAME_LEN
+            ),
+        });
+    }
+    if let Some(serial) = &config.serial_override
+        && serial.len() > MAX_SERIAL_NUMBER_LEN
+    {
+        return Err(Error::InvalidConfig {
+            error: format!(
+                "serial_override is too long: {} bytes, but the maximum is {}. \
+                 Please shorten the serial number override.",
+                serial.len(),
+                MAX_SERIAL_NUMBER_LEN
+            ),
+        });
+    }
 
     let num_non_plugin_slots =
         check_chip_sets(version, config, SUPPORTED_CHIP_TYPES_V2, &Family::Rp2350)?;
@@ -1845,17 +2055,68 @@ fn validate_config_v2(
         }
     }
 
-    if !config.swd_enabled && config.boot_logging {
-        return Err(Error::InvalidConfig {
-            error: "Boot logging cannot be enabled when SWD is disabled".to_string(),
-        });
-    }
+    // Turbo boot skips reading the image select jumpers, so only the first
+    // non-plugin slot is ever served at boot.  The other slots are still
+    // programmed and remain reachable at runtime, so this is refused rather
+    // than impossible - the caller can accept it.
+    let mut warnings = alloc::vec::Vec::new();
     if config.turbo_boot && num_non_plugin_slots > 1 {
-        return Err(Error::InvalidConfig {
-            error: "Turbo boot cannot be enabled when there is more than one non-plugin ROM slot"
-                .to_string(),
-        });
+        if overrides.turbo_boot_multi_slot {
+            warnings.push(ConfigWarning::TurboBootMultiSlot {
+                slots: num_non_plugin_slots,
+            });
+        } else {
+            return Err(Error::TurboBootMultiSlot {
+                slots: num_non_plugin_slots,
+            });
+        }
     }
 
-    Ok(())
+    Ok(warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A chip type only V2 serves is reachable on an RP2350 and nowhere else,
+    // so only an RP2350 build may be told which firmware version to move to.
+    #[test]
+    fn v2_only_chip_type_is_servable_on_rp2350_only() {
+        assert!(chip_type_servable_by_tool(
+            ChipType::Chip23C1001,
+            &Family::Rp2350
+        ));
+        assert!(!chip_type_servable_by_tool(
+            ChipType::Chip23C1001,
+            &Family::Stm32f4
+        ));
+    }
+
+    // A chip type V1 serves stays servable whichever MCU is targeted.
+    #[test]
+    fn v1_chip_type_is_servable_on_both_families() {
+        assert!(chip_type_servable_by_tool(
+            ChipType::Chip2364,
+            &Family::Rp2350
+        ));
+        assert!(chip_type_servable_by_tool(
+            ChipType::Chip2364,
+            &Family::Stm32f4
+        ));
+    }
+
+    // A chip type declared in chip-types.json but implemented by no builder is
+    // not servable, whatever it declares.  This is what stops a chip reserved
+    // for its name and pinout alone - 62256 today - from being reported as
+    // needing newer firmware, when no firmware version would serve it.
+    #[test]
+    fn chip_type_in_no_builder_list_is_not_servable() {
+        for family in [Family::Rp2350, Family::Stm32f4] {
+            assert!(
+                !chip_type_servable_by_tool(ChipType::Chip62256, &family),
+                "62256 reported servable on {family:?}"
+            );
+        }
+    }
 }

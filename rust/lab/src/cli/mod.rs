@@ -174,7 +174,8 @@ impl CsSettings {
         }
     }
 
-    pub fn to_polarities(&self) -> CsPolarities {
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn to_polarities(self) -> CsPolarities {
         CsPolarities {
             cs1: match self.cs1 {
                 CsPolaritySetting::Low => Some(false),
@@ -243,13 +244,12 @@ async fn session_loop(state: &mut SessionState) {
                 if send_line("").await.is_err() {
                     return;
                 }
-                if last_blank {
-                    if send_line("No command entered - use ?/h for help")
+                if last_blank
+                    && send_line("No command entered - use ?/h for help")
                         .await
                         .is_err()
-                    {
-                        return;
-                    }
+                {
+                    return;
                 }
             }
 

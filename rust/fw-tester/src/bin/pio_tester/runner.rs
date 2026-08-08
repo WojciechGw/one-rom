@@ -35,6 +35,14 @@
 //! `run_mode` once per combination.  Results are accumulated into a single
 //! `ModeResult`; `combos` records how many passes were made.
 
+// Several helpers here return `Result<T, SetResult>`, where the `Err` variant
+// is a fully-populated `SetResult` short-returned as the finished record for a
+// set (boot error, skip, gap error) rather than a lightweight error.
+// `SetResult` is meant to be large, this is an internal test-tool binary (not a
+// public API), and the value is moved on a cold early-return path, so boxing it
+// would add indirection and churn every call site for no real benefit.
+#![allow(clippy::result_large_err)]
+
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
@@ -42,15 +50,95 @@ use onerom_config::chip::{ChipType, ControlLineType};
 use onerom_config::fw::FirmwareVersion;
 use onerom_config::hw::Board;
 use onerom_fw_emulator::Emulator;
-use onerom_gen::{ChipConfig, ChipSetConfig, ChipSetType, Config, CsLogic};
+use onerom_gen::{ChipConfig, ChipSetConfig, ChipSetType, Config, CsConfig, CsLogic};
 
 use crate::report::{ChipResult, ModeResult, SetResult, TestReport};
+use onerom_fw_tester::cs_timing;
 use onerom_fw_tester::driver;
 use onerom_fw_tester::geometry;
+use onerom_fw_tester::geometry::chip_substitution;
 use onerom_fw_tester::oracle;
 use onerom_fw_tester::pin_cache::{ControlLine, PinCache};
 use onerom_fw_tester::runner::{addr_before_cs_cycles, cs_to_data_cycles, run_mode};
 use onerom_fw_tester::timing;
+
+/// Config-derived serving-algorithm info for one chip of a set, for the CS
+/// timing pass.  `None` (with the reason logged) when the combination does not
+/// derive, in which case the pass is skipped rather than run against a guess.
+fn alg_info_for(
+    board: Board,
+    chip_type: ChipType,
+    chip_config: &ChipConfig,
+    secondary: Option<&ChipConfig>,
+    set_type: ChipSetType,
+    num_chips: usize,
+    force_16_bit: bool,
+) -> Option<onerom_gen::compat::ServingAlgInfo> {
+    let cs_config = CsConfig::from_chip_type(
+        &chip_type,
+        chip_config.cs1,
+        chip_config.cs2,
+        chip_config.cs3,
+        chip_config.cs4,
+        chip_config.ce,
+        chip_config.oe,
+    );
+    let secondary_cs = secondary.map(|c| {
+        let t = c.chip_type.resolved();
+        CsConfig::from_chip_type(&t, c.cs1, c.cs2, c.cs3, c.cs4, c.ce, c.oe)
+    });
+    match onerom_gen::compat::serving_alg_info(
+        board,
+        chip_type,
+        set_type,
+        num_chips,
+        cs_config,
+        secondary_cs,
+        force_16_bit,
+    ) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            warn!(
+                "CS timing: no serving alg info for {}: {e}",
+                chip_type.name()
+            );
+            None
+        }
+    }
+}
+
+/// Run the CS timing pass, or record why it did not run.
+// Every argument is an independent input the pass needs; bundling them into a
+// struct would add a type whose only purpose is to be unpacked again.
+#[allow(clippy::too_many_arguments)]
+fn timing_pass(
+    emulator: &Emulator,
+    cache: &PinCache,
+    mode: u8,
+    addr_before_cs: u32,
+    background: (u64, u64),
+    info: Option<&onerom_gen::compat::ServingAlgInfo>,
+    num_addrs: usize,
+    gap_gpios: &[u8],
+    label: &str,
+) -> onerom_fw_tester::cs_timing::PassResult {
+    match info {
+        Some(i) => cs_timing::run_pass(
+            emulator,
+            cache,
+            mode,
+            addr_before_cs,
+            background,
+            i,
+            num_addrs,
+            gap_gpios,
+            label,
+        ),
+        None => onerom_fw_tester::cs_timing::PassResult::skipped(
+            "no serving algorithm info derives for this chip and board",
+        ),
+    }
+}
 
 // ── Capability helpers ────────────────────────────────────────────────────────
 
@@ -188,8 +276,8 @@ fn run_single_set(
     // use the PinCache for the first chip (the slot's primary).  Single sets
     // use no X pins, so n_used_x = 0.
     let gap_gpios: Vec<u8> = if let Some(chip_config) = chip_set.chips.first() {
-        let chip_type =
-            chip_substitution(board, chip_config.chip_type).unwrap_or(chip_config.chip_type);
+        let chip_type = chip_substitution(board, chip_config.chip_type.resolved())
+            .unwrap_or(chip_config.chip_type.resolved());
         let cache = PinCache::build(chip_type, chip_config, board);
         if let Err(r) = check_rom_pin_pulls(&emulator, &cache, set_idx) {
             return r;
@@ -200,7 +288,7 @@ fn run_single_set(
             base_dir,
             served_idx,
             fw_version,
-            chip_config.chip_type,
+            chip_config.chip_type.resolved(),
             &cache,
             0,
             set_idx,
@@ -296,7 +384,7 @@ fn run_multi_set(
 
     // ── Primary chip (chips[0], in One ROM's socket) ──────────────────────────
     let primary_config = &chip_set.chips[0];
-    let primary_requested = primary_config.chip_type;
+    let primary_requested = primary_config.chip_type.resolved();
     let primary_type = if let Some(sub) = chip_substitution(board, primary_requested) {
         warn!(
             "Set {} chip 0: {} on {} is not directly servable; \
@@ -368,7 +456,8 @@ fn run_multi_set(
         .enumerate()
         .map(|(i, chip_config)| {
             let (_, gpios) = board.x_pin_map()[i];
-            let assert_high = first_active_cs_polarity(chip_config, chip_config.chip_type);
+            let assert_high =
+                first_active_cs_polarity(chip_config, chip_config.chip_type.resolved());
             (gpios.to_vec(), assert_high)
         })
         .collect();
@@ -439,12 +528,39 @@ fn run_multi_set(
                 chips0_bg,
                 &gap_gpios,
             );
+            let t = timing_pass(
+                &emulator,
+                &primary_cache,
+                mode,
+                cycles_addr_before_cs,
+                chips0_bg,
+                alg_info_for(
+                    board,
+                    primary_type,
+                    primary_config,
+                    chip_set.chips.get(1),
+                    ChipSetType::Multi,
+                    chip_set.chips.len(),
+                    force_16_bit,
+                )
+                .as_ref(),
+                if mode == 16 {
+                    oracle.len() / 2
+                } else {
+                    oracle.len()
+                },
+                &gap_gpios,
+                &format!("set={set_idx} chip=0 mode={mode}bit"),
+            );
             mode_results.push(ModeResult {
                 mode,
                 reads,
                 failures,
                 bus_failures,
                 forced_low_failures,
+                timing_checks: t.checks,
+                timing_failures: t.failures,
+                timing_note: t.note,
                 combos: 1,
             });
         }
@@ -460,7 +576,7 @@ fn run_multi_set(
     // ── Test secondary chips (chips[1], chips[2], …) ──────────────────────────
     for (j, chip_config) in chip_set.chips.iter().skip(1).enumerate() {
         let chip_idx = j + 1;
-        let requested_type = chip_config.chip_type;
+        let requested_type = chip_config.chip_type.resolved();
         let chip_type = if let Some(sub) = chip_substitution(board, requested_type) {
             warn!(
                 "Set {} chip {}: {} on {} is not directly servable; \
@@ -639,12 +755,49 @@ fn run_multi_set(
                 total_forced_low_failures += forced_low_failures;
             }
 
+            // Once per mode, not once per combo: the extra address bits a
+            // combo varies do not change the serving path's latency, and the
+            // pass writes to the image, so repeating it is cost without cover.
+            // Combo 0's background is representative.
+            let t = timing_pass(
+                &emulator,
+                &secondary_cache,
+                mode,
+                cycles_addr_before_cs,
+                driver::merge(base_bg, (extra_mask, 0)),
+                // The sampled window and the algorithms belong to the *slot*,
+                // which derives from chips[0] — a secondary shares them, and
+                // deriving from its own chip type asks a question the set does
+                // not pose.  Its own control lines still decide whether it
+                // lands inside that window.
+                alg_info_for(
+                    board,
+                    primary_type,
+                    &chip_set.chips[0],
+                    chip_set.chips.get(1),
+                    ChipSetType::Multi,
+                    chip_set.chips.len(),
+                    force_16_bit,
+                )
+                .as_ref(),
+                if mode == 16 {
+                    oracle.len() / 2
+                } else {
+                    oracle.len()
+                },
+                &gap_gpios,
+                &format!("set={set_idx} chip={chip_idx} mode={mode}bit"),
+            );
+
             mode_results.push(ModeResult {
                 mode,
                 reads: total_reads,
                 failures: total_failures,
                 bus_failures: total_bus_failures,
                 forced_low_failures: total_forced_low_failures,
+                timing_checks: t.checks,
+                timing_failures: t.failures,
+                timing_note: t.note,
                 combos: n_combos as u32,
             });
         }
@@ -688,18 +841,18 @@ fn run_banked_set(
 
     // All chips in a banked set must be the same type — they share the same
     // socket and the same PinCache; only the oracle and X pin state vary.
-    let chip_type_0 = chip_set.chips[0].chip_type;
+    let chip_type_0 = chip_set.chips[0].chip_type.resolved();
     if let Some(pos) = chip_set
         .chips
         .iter()
-        .position(|c| c.chip_type != chip_type_0)
+        .position(|c| c.chip_type.resolved() != chip_type_0)
     {
         error!(
             "Set {}: banked sets require a uniform chip type; \
              chip {} is {} but chip 0 is {}",
             set_idx,
             pos,
-            chip_set.chips[pos].chip_type.name(),
+            chip_set.chips[pos].chip_type.resolved().name(),
             chip_type_0.name(),
         );
         return SetResult::skipped(
@@ -848,12 +1001,39 @@ fn run_banked_set(
                 bg,
                 &gap_gpios,
             );
+            let t = timing_pass(
+                &emulator,
+                &cache,
+                mode,
+                cycles_addr_before_cs,
+                bg,
+                alg_info_for(
+                    board,
+                    chip_type,
+                    chip_config,
+                    None,
+                    ChipSetType::Banked,
+                    chip_set.chips.len(),
+                    force_16_bit,
+                )
+                .as_ref(),
+                if mode == 16 {
+                    oracle.len() / 2
+                } else {
+                    oracle.len()
+                },
+                &gap_gpios,
+                &format!("set={set_idx} bank={bank} mode={mode}bit"),
+            );
             mode_results.push(ModeResult {
                 mode,
                 reads,
                 failures,
                 bus_failures,
                 forced_low_failures,
+                timing_checks: t.checks,
+                timing_failures: t.failures,
+                timing_note: t.note,
                 combos: 1,
             });
         }
@@ -896,6 +1076,25 @@ fn boot_set(
     debug!("Set {}: booting firmware", set_idx);
     let mut emulator = Emulator::boot();
 
+    // Confirm the firmware selected the image this set drove the sel pins for.
+    // A sel value beyond the board's pin count wraps, by design — run_all
+    // accounts for that (oracle substitution, one-beyond test), so compare
+    // against the wrapped value rather than the raw request.  Any other
+    // discrepancy means the set would silently have tested a different ROM.
+    let max_images = 1usize << board.sel_pins().len();
+    let expected_image = (sel_image as usize % max_images) as u8;
+    if emulator.sel_image() != expected_image {
+        error!(
+            "Set {}: firmware selected image {}, not {}",
+            set_idx,
+            emulator.sel_image(),
+            expected_image
+        );
+        return Err(SetResult::boot_error(
+            set_idx,
+            "firmware selected a different image — the set would have tested the wrong ROM",
+        ));
+    }
     if emulator.limp_mode() {
         error!("Set {}: firmware entered limp mode", set_idx);
         return Err(SetResult::boot_error(set_idx, "firmware entered limp mode"));
@@ -976,7 +1175,7 @@ fn run_chip(
     background_mask: (u64, u64),
     gap_gpios: &[u8],
 ) -> ChipResult {
-    let requested_chip_type = chip_config.chip_type;
+    let requested_chip_type = chip_config.chip_type.resolved();
 
     // Apply any board-specific chip substitutions.  Some boards cannot serve
     // a chip in its native mode but can do so with a physical shim that
@@ -1070,12 +1269,39 @@ fn run_chip(
             background_mask,
             gap_gpios,
         );
+        let t = timing_pass(
+            emulator,
+            &cache,
+            mode,
+            cycles_addr_before_cs,
+            background_mask,
+            alg_info_for(
+                board,
+                chip_type,
+                chip_config,
+                None,
+                ChipSetType::Single,
+                1,
+                force_16_bit,
+            )
+            .as_ref(),
+            if mode == 16 {
+                oracle.len() / 2
+            } else {
+                oracle.len()
+            },
+            gap_gpios,
+            &format!("set={set_idx} chip={chip_idx} mode={mode}bit"),
+        );
         mode_results.push(ModeResult {
             mode,
             reads,
             failures,
             bus_failures,
             forced_low_failures,
+            timing_checks: t.checks,
+            timing_failures: t.failures,
+            timing_note: t.note,
             combos: 1,
         });
     }
@@ -1204,6 +1430,7 @@ fn gap_set_for_slot(
 fn per_chip_select_name(secondary: &ChipConfig) -> Option<&'static str> {
     secondary
         .chip_type
+        .resolved()
         .control_lines()
         .iter()
         .filter(|spec| matches!(spec.line_type, ControlLineType::Configurable))
@@ -1350,21 +1577,14 @@ fn check_x_pin_pulls(
 /// is needed.
 ///
 /// Add new entries here as further board/chip shim combinations are discovered.
-fn chip_substitution(board: Board, chip_type: ChipType) -> Option<ChipType> {
-    match (board, chip_type) {
-        // fire-32-a cannot drive SST39SF040 directly; a pin-remap shim allows
-        // it to serve the image as a 27C040 instead.
-        (Board::Fire32A, ChipType::ChipSST39SF040) => Some(ChipType::Chip27C040),
-        _ => None,
-    }
-}
-
 fn word_size_for_set(chip_set: &ChipSetConfig) -> u8 {
     chip_set
         .chips
         .first()
         .map(|c| {
-            if c.chip_type == ChipType::Chip27C400 || c.chip_type == ChipType::Chip27C200 {
+            if c.chip_type.resolved() == ChipType::Chip27C400
+                || c.chip_type.resolved() == ChipType::Chip27C200
+            {
                 16
             } else {
                 8

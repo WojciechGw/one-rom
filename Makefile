@@ -5,7 +5,7 @@
 
 VERSION_MAJOR := 0
 VERSION_MINOR := 7
-VERSION_PATCH := 0
+VERSION_PATCH := 1
 BUILD_NUMBER := 1
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 export VERSION_MAJOR VERSION_MINOR VERSION_PATCH BUILD_NUMBER GIT_COMMIT
@@ -52,37 +52,9 @@ BOOT_LOGGING ?= 0
 PLUGIN_LOGGING ?= 0
 # PLUGIN_LOGGING ?= 1
 
-# Main loop logging configuration
-#
-# This option enables/disabld logging within main_loop (see sdrr.rom_impl.c).
-#
-# It does not loop after every byte is served - that is enabled/disabled via
-# MAIN_LOOP_ONE_SHOT.
-#
-# BOOT_LOGGING and MAIN_LOOP_LOGGING are required for this option to work.
-
-MAIN_LOOP_LOGGING ?= 0
-#MAIN_LOOP_LOGGING ?= 1
-
-# Main loop one shot logging
-#
-# This option outputs logs after every byte is retrieved from the ROM.  While
-# the main loop that processes the chip select and retrieves ROM data remanins
-# functional, there is a gap between the CS line being released, and the ROM
-# detecting the next CS activation - to make these logs.
-#
-# Therefore, with this option, the ROM will not meet its timing requirements,
-# and it is not recommended to use this option unless you are debugging the
-# ROM code.
-#
-# BOOT_LOGGING is required for this option to work.
-
-MAIN_LOOP_ONE_SHOT ?= 0
-# MAIN_LOOP_ONE_SHOT ?= 1
-
 # Debug logging
 #
-# More extensive logging than the boot and main loop logging options.
+# More extensive logging than the boot logging option.
 #
 # May overwhelm the SWD interface, meaning logs are dropped.
 #
@@ -215,7 +187,30 @@ ifneq ($(SUPPRESS_OUTPUT),1)
 $(info -----)
 endif
 
-.PHONY: all clean clean-firmware clean-firmware-build firmware run flash test test-emu test-api generated clean-generated fw-config-gen libonerom-test gen-config clean-gen-config clean-libonerom-test
+# Strip the environment cargo injects into a build script, so that a cargo we
+# launch sees the same ambient environment however we were reached.
+#
+# onerom-fw-emulator's build.rs runs `make libonerom-test`, which depends on
+# gen-config, so the cargo invocations below happen both directly from a shell
+# and nested inside that build script.  The nested one inherits CARGO_PKG_NAME,
+# CARGO_CFG_*, OUT_DIR and some forty others from its parent.  Cargo checks
+# `rerun-if-env-changed` variables against its own process environment, and
+# ring's build script declares a rerun dependency on thirteen of them, so the
+# two invocations disagree about ring and rebuild it — plus rustls, webpki,
+# tokio-rustls, hyper-rustls, reqwest and onerom-fw behind it — every time they
+# alternate.  That was ~18s on every one of the ~474 emulator tests.
+#
+# Scrub the whole injected set rather than the variables ring happens to read
+# today: a dependency that tracks a different one would silently bring the
+# rebuild back, and a partial scrub is indistinguishable from none.  Cargo's own
+# configuration (CARGO_HOME, CARGO_TARGET_DIR, CARGO_BUILD_*, ...) is not part
+# of that set and is deliberately left alone.
+SCRUB_CARGO_ENV = for v in $$(env | grep -oE '^(CARGO_CFG_[A-Z_0-9]+|CARGO_FEATURE_[A-Z_0-9]+|CARGO_PKG_[A-Z_0-9]+|DEP_[A-Za-z_0-9]+)=' | tr -d '='); do unset "$$v"; done; \
+	unset CARGO CARGO_MANIFEST_DIR CARGO_MANIFEST_PATH CARGO_MANIFEST_LINKS \
+	      CARGO_MAKEFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_CRATE_NAME CARGO_BIN_NAME \
+	      OUT_DIR TARGET HOST NUM_JOBS OPT_LEVEL DEBUG PROFILE RUSTC RUSTDOC;
+
+.PHONY: all clean clean-firmware clean-firmware-build firmware run flash test test-emu test-api test-monitor test-rbcp generated clean-generated fw-config-gen libonerom-test libonerom-test-wasm gen-config clean-gen-config clean-libonerom-test clean-libonerom-test-wasm
 
 all: firmware
 	@echo "=========================================="
@@ -231,16 +226,16 @@ generated:
 	@echo "=========================================="
 	@echo "Building onerom-metadata, to generate metadata header file"
 	@echo "-----"
-	@cd rust && cargo build --$(CARGO_PROFILE) -p onerom-metadata
+	@$(SCRUB_CARGO_ENV) cd rust && cargo build --$(CARGO_PROFILE) -p onerom-metadata
 
 fw-config-gen:
-	@cd rust && cargo build --$(CARGO_PROFILE) -p fw-config-gen --quiet
+	@$(SCRUB_CARGO_ENV) cd rust && cargo build --$(CARGO_PROFILE) -p fw-config-gen --quiet
 
 firmware: generated
 	@echo "=========================================="
 	@echo "Building One ROM firmware - RP235X"
 	@echo "-----"
-	@GEN_OUTPUT_DIR=$(GEN_OUTPUT_DIR) EXTRA_C_FLAGS="$(EXTRA_C_FLAGS)" BIN_PREFIX="$(BIN_PREFIX)" DEBUG_LOGGING=$(DEBUG_LOGGING) PLUGIN_LOGGGING=$(PLUGIN_LOGGING) make --no-print-directory -C $(FIRMWARE_DIR)
+	@GEN_OUTPUT_DIR=$(GEN_OUTPUT_DIR) EXTRA_C_FLAGS="$(EXTRA_C_FLAGS)" BIN_PREFIX="$(BIN_PREFIX)" DEBUG_LOGGING=$(DEBUG_LOGGING) PLUGIN_LOGGING=$(PLUGIN_LOGGING) make --no-print-directory -C $(FIRMWARE_DIR)
 	@if command -v picotool >/dev/null 2>&1; then \
 		picotool uf2 convert $(BUILD_DIR)/$(BIN_PREFIX).bin $(BUILD_DIR)/$(BIN_PREFIX).uf2; \
 	else \
@@ -295,6 +290,18 @@ test-api: gen-config
 	@echo "-----"
 	@BASE_DIR=$(CURDIR) CONFIG=$(CONFIG) BOARD=$(BOARD) cargo run --manifest-path rust/Cargo.toml -p onerom-fw-tester --bin plugin-api-tester --quiet
 
+test-monitor: gen-config
+	@echo "=========================================="
+	@echo "Running One ROM emulator tests"
+	@echo "-----"
+	@BASE_DIR=$(CURDIR) CONFIG=$(CONFIG) BOARD=$(BOARD) cargo run --manifest-path rust/Cargo.toml -p onerom-fw-tester --bin address-monitor-tester --quiet
+
+test-rbcp: gen-config
+	@echo "=========================================="
+	@echo "Running One ROM emulator tests"
+	@echo "-----"
+	@BASE_DIR=$(CURDIR) CONFIG=$(CONFIG) BOARD=$(BOARD) cargo run --manifest-path rust/Cargo.toml -p onerom-plugin-tester --bin rbcp-tester --quiet
+
 libonerom-test: gen-config
 	@echo "=========================================="
 	@echo "Building libonerom-test"
@@ -302,6 +309,18 @@ libonerom-test: gen-config
 	EXTRA_C_FLAGS="$(EXTRA_C_FLAGS)" make --no-print-directory -C $(FIRMWARE_DIR) -f test.mk
 	@echo "-----"
 	@echo "Done building libonerom-test"
+
+# WebAssembly build of libonerom-test (for One ROM Lens).  Cross-compiles with
+# Emscripten into a separate build-wasm/ so it never clashes with the native
+# build-test/ objects.  Driven by onerom-fw-emulator's build.rs when its cargo
+# target is wasm.
+libonerom-test-wasm: gen-config
+	@echo "=========================================="
+	@echo "Building libonerom-test (WebAssembly)"
+	@echo "-----"
+	EXTRA_C_FLAGS="$(EXTRA_C_FLAGS)" make --no-print-directory -C $(FIRMWARE_DIR) -f test.mk WASM=1 BUILD_DIR=build-wasm
+	@echo "-----"
+	@echo "Done building libonerom-test (WebAssembly)"
 
 -include $(GEN_OUTPUT_DIR)/generated.mk
 
@@ -324,4 +343,7 @@ clean-gen-config:
 clean-libonerom-test: clean-gen-config
 	+cd $(FIRMWARE_DIR) && make -f test.mk clean-test
 
-clean: clean-firmware clean-rust clean-generated clean-gen-config clean-libonerom-test
+clean-libonerom-test-wasm: clean-gen-config
+	+cd $(FIRMWARE_DIR) && make -f test.mk clean-test BUILD_DIR=build-wasm
+
+clean: clean-firmware clean-rust clean-generated clean-gen-config clean-libonerom-test clean-libonerom-test-wasm

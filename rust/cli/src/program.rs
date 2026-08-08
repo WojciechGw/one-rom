@@ -13,8 +13,8 @@ use crate::firmware::{
     acquire_firmware, build_rom_image, confirm_slot_overrides, resolve_config_json,
     verify_assembled_firmware,
 };
-use crate::utils::{check_device, resolve_board};
-use onerom_cli::device::select_device;
+use crate::utils::{check_device, check_fire_board_optional, resolve_board};
+use onerom_cli::device::select_device_by_chip_id;
 use onerom_cli::plugin::{parse_plugins, resolve_plugins};
 use onerom_cli::slot::{GlobalConfig, check_slot_confirmations, save_config};
 use onerom_cli::usb::{RebootArgs, flash_program, flash_program_read, reboot};
@@ -118,9 +118,9 @@ async fn build_and_assemble(
         &args.slot,
         args.no_config,
         board,
+        &version,
         Some(&global_config),
         &plugins,
-        args.allow_unsupported_chip_type,
     )?;
 
     if let Some(path) = &args.save_config {
@@ -131,7 +131,7 @@ async fn build_and_assemble(
     }
 
     let (fw_props, metadata, image_data, desc) =
-        build_rom_image(options, &config_json, version, *board, *mcu).await?;
+        build_rom_image(options, &config_json, version, *board, *mcu, args.force).await?;
 
     validate_sizes(&fw_props, &firmware_data, &metadata, &image_data)?;
 
@@ -178,11 +178,11 @@ async fn reboot_to_stopped_if_running(options: &mut Options) -> Result<(), Error
     if options.verbose {
         println!("Device is running, rebooting into stopped mode...");
     }
-    let serial = device.serial.clone();
+    let chip_id = device.chip_id;
     reboot(device, &RebootArgs::stopped(false, false)).await?;
 
     let new_device =
-        select_device(serial.as_deref(), options.unrecognised, &options.vid_pid).await?;
+        select_device_by_chip_id(chip_id, options.unrecognised, &options.vid_pid).await?;
     if new_device.is_running() {
         return Err(Error::DeviceStillRunning);
     }
@@ -201,12 +201,12 @@ async fn reboot_and_rescan(options: &mut Options, reboot_args: &RebootArgs) -> R
     if options.verbose {
         println!("Rebooting device...");
     }
-    let serial = device.serial.clone();
+    let chip_id = device.chip_id;
     reboot(device, reboot_args).await?;
 
     if !reboot_args.fast {
         let device =
-            select_device(serial.as_deref(), options.unrecognised, &options.vid_pid).await?;
+            select_device_by_chip_id(chip_id, options.unrecognised, &options.vid_pid).await?;
         if options.verbose {
             println!("{device}");
         }
@@ -227,13 +227,13 @@ pub async fn cmd_program(
     // Board must be resolved before acquire_program_image so it is available
     // for chip type validation when parsing --slot arguments.
     let board = resolve_board(options, &args.board)?;
+    check_fire_board_optional(&board)?;
     let mcu = Variant::RP2350;
 
     if let Some(b) = &board
         && !args.slot.is_empty()
     {
-        let confirmations =
-            check_slot_confirmations(&args.slot, b, args.allow_unsupported_chip_type)?;
+        let confirmations = check_slot_confirmations(&args.slot, b)?;
         confirm_slot_overrides(options, &confirmations).await?;
     }
 

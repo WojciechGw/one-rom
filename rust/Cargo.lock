@@ -4881,7 +4881,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onerom-app"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "hex",
  "onerom-config",
@@ -4897,7 +4897,7 @@ dependencies = [
 
 [[package]]
 name = "onerom-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "built",
@@ -4932,7 +4932,7 @@ dependencies = [
 
 [[package]]
 name = "onerom-config"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "schemars",
  "serde",
@@ -4941,7 +4941,7 @@ dependencies = [
 
 [[package]]
 name = "onerom-database"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "csv",
  "hex-literal",
@@ -4952,7 +4952,7 @@ dependencies = [
 
 [[package]]
 name = "onerom-fw"
-version = "0.1.25"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4971,16 +4971,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "onerom-fw-driver"
+version = "0.1.0"
+
+[[package]]
 name = "onerom-fw-emulator"
 version = "0.1.0"
 dependencies = [
  "bindgen",
  "onerom-config",
+ "onerom-fw-driver",
+]
+
+[[package]]
+name = "onerom-fw-geometry"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "onerom-config",
+ "onerom-fw-driver",
+ "onerom-gen",
 ]
 
 [[package]]
 name = "onerom-fw-parser"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "airfrog-rpc",
  "deku 0.19.1",
@@ -5002,6 +5017,7 @@ dependencies = [
  "onerom-config",
  "onerom-fw",
  "onerom-fw-emulator",
+ "onerom-fw-geometry",
  "onerom-gen",
  "onerom-metadata",
  "rand 0.10.2",
@@ -5010,7 +5026,7 @@ dependencies = [
 
 [[package]]
 name = "onerom-gen"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "onerom-config",
  "onerom-metadata",
@@ -5042,8 +5058,6 @@ dependencies = [
  "log",
  "once_cell",
  "onerom-config",
- "onerom-database",
- "onerom-protocol",
  "panic-probe",
  "panic-rtt-target",
  "portable-atomic",
@@ -5053,8 +5067,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "onerom-lens"
+version = "0.1.0"
+dependencies = [
+ "onerom-config",
+ "onerom-fw-emulator",
+ "onerom-fw-geometry",
+ "onerom-gen",
+ "serde_json",
+]
+
+[[package]]
 name = "onerom-metadata"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "hashbrown 0.17.1",
  "onerom-config",
@@ -5065,8 +5090,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "onerom-protocol"
+name = "onerom-plugin-tester"
 version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "onerom-config",
+ "onerom-fw-emulator",
+ "onerom-fw-tester",
+ "onerom-gen",
+ "serde_json",
+]
+
+[[package]]
+name = "onerom-protocol"
+version = "0.1.1"
 dependencies = [
  "log",
  "onerom-database",
@@ -5075,7 +5113,7 @@ dependencies = [
 
 [[package]]
 name = "onerom-studio"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "built",
@@ -5088,6 +5126,7 @@ dependencies = [
  "hex",
  "iced",
  "log",
+ "onerom-cli",
  "onerom-config",
  "onerom-fw",
  "onerom-fw-parser",
@@ -5362,9 +5401,9 @@ checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
 name = "picoboot"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef6ddb13dcbad7d14bfb359b152836f3941d55b8c23e4ce558d3e296a4fa27f3"
+checksum = "2f05132181168f595378f448dd62ffed9f897154359f52447ccd8d6174603f3e"
 dependencies = [
  "airfrog-rpc",
  "deku 0.20.3",

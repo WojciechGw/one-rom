@@ -17,6 +17,8 @@ To update the version:
   - [protocol](/rust/protocol/Cargo.toml)
   - [lab](/rust/lab/Cargo.toml)
   - [metadata](/rust/metadata/Cargo.toml)
+  - [app](/rust/app/Cargo.toml)
+  - [cli](/rust/cli/Cargo.toml)
 - If the firmware metadata/image format version has changed, update the
   `MAX_VERSION_*` consts in [rust/fw-parser/src/lib.rs](/rust/fw-parser/src/lib.rs).
 
@@ -58,8 +60,6 @@ cd rust
 cargo publish --dry-run -p onerom-protocol
 cargo publish -p onerom-protocol
 ```
-
-Update links to `onerom-database` and `onerom-protocol` in [lab/Cargo.toml](/rust/lab/Cargo.toml) to use the crates.io versions.
 
 ---
 
@@ -118,6 +118,31 @@ cargo publish -p onerom-fw
 ```
 
 Update links to and `onerom-fw` in others to use the crates.io versions.
+
+---
+
+Publish `onerom-app` to crates.io (depends on `onerom-config` and
+`onerom-gen`, so publish those first):
+
+```bash
+cd rust
+cargo publish --dry-run -p onerom-app
+cargo publish -p onerom-app
+```
+
+Update links to `onerom-app` in others to use the crates.io version.
+
+---
+
+Publish `onerom-cli` to crates.io (depends on `onerom-app`, `onerom-config`,
+`onerom-fw`, `onerom-gen`, `onerom-fw-parser` and `onerom-metadata`, so publish
+those first):
+
+```bash
+cd rust
+cargo publish --dry-run -p onerom-cli
+cargo publish -p onerom-cli
+```
 
 ---
 

@@ -302,14 +302,8 @@ void setup_initial_gpios(void) {
     }
 
 #if REAL_HARDWARE
-    // If there's a status LED, set it up as an output pin, high (LED off).
-    if (HW->gpio_status < MAX_GPIOS) {
-        uint8_t pin = HW->gpio_status;
-        GPIO_PAD(pin) &= ~(PAD_OUTPUT_DISABLE | PAD_INPUT);
-        GPIO_PAD(pin) |= PAD_DRIVE(PAD_DRIVE_4MA);
-        SIO_GPIO_OE_SET_PIN(pin);
-        SIO_GPIO_OUT_SET_PIN(pin);
-    }
+    // Set up the status LED pin (output, driven high = LED off).
+    setup_status_led();
 
     // If there's a neo-pixel LED, set it up as an output pin, high.  Note
     // the neopixel LED might be the same as the regular status LED, in which
@@ -689,7 +683,7 @@ void disable_sel_pins(void) {
                 (pin == HW->gpio_swdio)) {
                 DEBUG("Restore pin %d", pin);
 
-                GPIO_CTRL(ii) = GPIO_CTRL_RESET;
+                GPIO_CTRL(pin) = GPIO_CTRL_RESET;
                 // Use measured value to restore function
                 if (pin == HW->gpio_swclk) {
                     GPIO_PAD(SWCLK_PAD) = 0x5A;
@@ -700,14 +694,49 @@ void disable_sel_pins(void) {
         }
     }
 }
+
+// Shut SWD down for the remainder of this power cycle.
+//
+// Called just before we start serving, so a probe is usable for the whole of
+// boot (including boot logging, which rides RTT over SWD) and only goes away
+// once serving starts.  There is deliberately no path back - the pads stay
+// isolated until the next reset.
+//
+// The point is to stop the debug port's SRAM accesses stealing cycles from
+// the serving DMAs.  It is not a debug lockout: the boot ROM runs before we
+// do, and BOOTSEL/PICOBOOT are unaffected.
+//
+// Same mechanism as the shared image select pin handling in setup_sel_pins()
+// - force the debug port to attach internally, and isolate both SWD pads so
+// an external probe can no longer clock the port - but applied to both pads
+// unconditionally, as SWD may not be shared with a sel pin on this board.
+void disable_swd(void) {
+    SYSCFG_DBGFORCE |= SYSCFG_DBGFORCE_ATTACH_BIT;
+    GPIO_PAD(SWCLK_PAD) = (1 << PAD_ISO_BIT);
+    GPIO_PAD(SWDIO_PAD) = (1 << PAD_ISO_BIT);
+}
 #endif // !TEST_BUILD
 
 void setup_status_led(void) {
-    // No-op - done in setup_gpio()
+#if REAL_HARDWARE
+    // Configure the status LED GPIO as an SIO push-pull output, driven high so
+    // the LED is off (active-low wiring). Idempotent and self-contained, so it
+    // is safe to call repeatedly - e.g. a fault handler calls it to reclaim the
+    // pin (funcsel/drive/OE) before forcing the LED on, in case a plugin such
+    // as the neopixel driver had reconfigured it.
+    if (HW->gpio_status < MAX_GPIOS) {
+        uint8_t pin = HW->gpio_status;
+        GPIO_CTRL(pin) = GPIO_CTRL_RESET;   // SIO function
+        GPIO_PAD(pin) &= ~(PAD_OUTPUT_DISABLE | PAD_INPUT);
+        GPIO_PAD(pin) |= PAD_DRIVE(PAD_DRIVE_4MA);
+        SIO_GPIO_OE_SET_PIN(pin);
+        SIO_GPIO_OUT_SET_PIN(pin);
+    }
+#endif // REAL_HARDWARE
 }
 
 void blink_pattern(uint32_t on_time, uint32_t off_time, uint8_t repeats) {
-    if (RUNTIME->status_led_enabled && HW->gpio_status <= MAX_GPIOS) {
+    if (RUNTIME->status_led_enabled && HW->gpio_status < MAX_GPIOS) {
         uint8_t pin = HW->gpio_status;
         for(uint8_t i = 0; i < repeats; i++) {
             status_led_on(pin);

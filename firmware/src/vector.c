@@ -172,19 +172,21 @@ void Reset_Handler(void) {
 
 // Default handler for unhandled interrupts - fast continuous blink
 void Default_Handler(void) {
-    onerom_runtime_info_t *runtime_info = (onerom_runtime_info_t *)_onerom_runtime_info_ram;
-    if (runtime_info->status_led_enabled) {
-        setup_status_led();
-        while (1) {
-            blink_pattern(100000, 100000, 255);
-        }
+    // Halt regardless of the status LED: an unhandled interrupt stays pending,
+    // so returning from here just re-enters in a tight spin.  blink_pattern()
+    // gates on status_led_enabled, so the LED only blinks when it is enabled.
+    setup_status_led();
+    while (1) {
+        blink_pattern(100000, 100000, 255);
     }
 }
 
 // NMI_Handler - single blink pattern
 void NMI_Handler(void) {
+    // Force the status LED on so the fault is visible even if it was off.
+    RUNTIME->status_led_enabled = 1;
     setup_status_led();
-    
+
     while(1) {
         blink_pattern(100000, 500000, 1); // Single blink
         delay(1000000); // Long pause
@@ -213,6 +215,8 @@ void HardFault_C(stacked_frame_t *frame) {
     (void)mmfar;
     (void)bfar;
 
+    // Force the status LED on so the fault is visible even if it was off.
+    RUNTIME->status_led_enabled = 1;
     setup_status_led();
     while(1) {
         blink_pattern(100000, 200000, 2);
@@ -232,8 +236,10 @@ void __attribute__((naked)) HardFault_Handler(void) {
 
 // BusFault_Handler - triple blink pattern
 void BusFault_Handler(void) {
+    // Force the status LED on so the fault is visible even if it was off.
+    RUNTIME->status_led_enabled = 1;
     setup_status_led();
-    
+
     while(1) {
         blink_pattern(100000, 200000, 3); // Triple blink
         delay(1000000); // Long pause
@@ -242,8 +248,10 @@ void BusFault_Handler(void) {
 
 // UsageFault_Handler - quadruple blink pattern
 void UsageFault_Handler(void) {
+    // Force the status LED on so the fault is visible even if it was off.
+    RUNTIME->status_led_enabled = 1;
     setup_status_led();
-    
+
     while(1) {
         blink_pattern(100000, 200000, 4); // Quadruple blink
         delay(1000000); // Long pause

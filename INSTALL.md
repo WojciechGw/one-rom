@@ -68,11 +68,17 @@ However, we strongly recommend sticking to a *nix based host (Linux or macOS) fo
     ```bash
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
     source $HOME/.cargo/env
-    rustup target install thumbv7em-none-eabihf
-    rustup target install thumbv8m.main-none-eabihf
     cargo install cross
     cargo install wasm-pack   # Only required to build one-rom-wasm
     cargo install cargo-dist  # Only required to build One ROM Studio installers
+    ```
+
+    The One ROM hardware tester (`onerom-lab`) runs on the RP2350 and is built
+    with the nightly toolchain (pinned by its `rust-toolchain.toml`).  You only
+    need this if you are building the tester:
+
+    ```bash
+    rustup toolchain install nightly --component clippy,rustfmt --target thumbv8m.main-none-eabihf
     ```
 
     If planning to build One ROM Studio for all possible targets (you likely only want to build a subset!) you will also need to install additional Rust targets and the mingw-w64 toolchain for Windows targets.  If you just want to build the One ROM firmware you do not need to do this step.
@@ -103,15 +109,13 @@ At this point you can follow the instructions below to build and flash the firmw
 
 ## Building the Firmware
 
-To build the firmware, you use a command like this:
+To build the base firmware, run `make` from the repo root.  Add `DEBUG_LOGGING=1` for debug logging.
+
+To build a firmware image to flash to a One ROM, you use the CLI tool, which you can build from `rust/cli` or download from [One ROM CLI](https://onerom.org/cli).  For example:
 
 ```bash
-scripts/onerom.sh fire-24-d onerom-config/vic20-pal.json
+onerom firmware build --base-firmware firmware/build/onerom-rp235x.bin --config onerom-config/vic20-pal.json /tmp/firmware.bin
 ```
-
-To flash, use `-f`, to include regular and debug logging use `-l` and `-d` respectively.
-
-You can also use make commands as described below, but running make directly has been deprecated in favour of the `scripts/onerom.sh` script.
 
 ## Programming the Firmware
 
@@ -124,7 +128,7 @@ After building the firmware as above, use the binary from `firmware/build/onerom
 - [One ROM Studio](https://onerom.org/studio)
 - [One ROM Web](https://onerom.org/web)
 
-If both cases, you need to select the option to upload a local firmware binary, and then program it.
+If all cases, you need to select the option to upload a local firmware binary, and then program it.
 
 You also have board specific, third-party, options:
 
@@ -157,29 +161,5 @@ Note that as well as `firmware/build/onerom-rp235x.bin`, an ELF file is created 
 
 See [Pi-PICO-PROGRAMMER](/docs/PI-PICO-PROGRAMMER.md) for details of using a Raspberry Pi Pico as an inexpensive SWD programmer.  Many other SWD programmers are available, like the Raspberry Pi Debug Probe, generic DAPLink, ST-Link, etc. 
 
-Occassionally your One ROM may lock up, particularly if you are experimenting with overclocking or other advanced configuration options, or debugging firmware changes.  If this is is the case, try rebooting your programmer, One ROM, or both, and try again.  If you still have problems, see [Recovering a Bricked Device](docs/GETTING-STARTED.md#recovering-a-bricked-device) for help.
+Occassionally your One ROM may lock up, particularly if you are experimenting with overclocking or other advanced configuration options, or debugging firmware changes.  If this is is the case, try rebooting your programmer, One ROM, or both, and try again.  If you still have problems, see [Recovering a Bricked Device](docs/old/GETTING-STARTED.md#recovering-a-bricked-device) for help.
 
-## Additional Make Targets
-
-To build and then review the contents of the firmware run:
-
-```bash
-XXX make info
-XXX make info-detail # More details
-```
-
-To perform consistency checking on the firmware run the following:
-
-```bash
-XXX make test
-```
-
-Not all ROM types support this testing.  Please raise an issue if your specific ROM type fails this test.
-
-## Debugging
-
-To enable both high-level logging and debug logging, use the following when building:
-
-```bash
-BOOT_LOGGING=1 DEBUG_LOGGING=1 CONFIG=config/vic20-pal.mk make
-```

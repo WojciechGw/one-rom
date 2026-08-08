@@ -89,12 +89,12 @@ int firmware_main(void) {
         preload_rom_image();
     }
 
-    // Setup status LED up now, so we don't need to call the function from the
-    // main loop - which might be running from RAM.
-    if (RUNTIME->status_led_enabled) {
-        DEBUG("Init LED");
-        setup_status_led();
-    }
+    // Set up the status LED hardware now (unconditionally - the pin is
+    // configured as an output whether or not the LED is currently on), so we
+    // don't need to call the function from the main loop, which might be
+    // running from RAM.
+    DEBUG("Init LED");
+    setup_status_led();
 
     // If no ROM slot is selected, enter limp mode now that the status LED is
     // setup.
@@ -113,5 +113,18 @@ int firmware_main(void) {
     // starts any plugins.  We do it from higher up the stack, so the minimum
     // stack is used for any plugin running on this core. 
     LOG("Setup ROM serving");
+
+    // Shut SWD down before serving starts, if configured to do so.  Done last
+    // so a probe is available for all of boot - including boot logging, which
+    // rides RTT over SWD.  Nothing is logged beyond this point, and plugins
+    // (started from vector.c once pio() returns) get no logging either.
+    //
+    // Cheap enough - a RAM test and a few register writes - to do even when
+    // turbo booting.
+    if (!RUNTIME->swd_enabled) {
+        LOG("Disabling SWD");
+        disable_swd();
+    }
+
     return pio();
 }

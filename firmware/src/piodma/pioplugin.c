@@ -7,6 +7,75 @@
 #include "include.h"
 #include "piodma/piodma.h"
 
+// ---------------------------------------------------------------------------
+// Address-monitor emulation seams
+//
+// On real hardware the address-monitor DMA is configured by writing DMA
+// channel registers, and its ring write position lives in the channel's
+// write_addr register.  Under emulation there are no such registers, so the
+// firmware routes both through injected seams (mirroring sram_to_host /
+// set_host_sram_ptr): pio_setup_address_monitor_dma calls the injected
+// configure callback with the block/SM/ring it chose (so a wrong choice is
+// caught, not masked), and the ring write position is read from a slot the
+// harness points at epio's live capture write pointer.
+// ---------------------------------------------------------------------------
+#if !REAL_HARDWARE
+static monitor_dma_configure_fn_t s_host_monitor_dma_configure = NULL;
+
+void set_host_monitor_dma_configure(monitor_dma_configure_fn_t fn) {
+    s_host_monitor_dma_configure = fn;
+}
+
+static volatile uint32_t * volatile *s_host_monitor_write_slot = NULL;
+
+void set_host_monitor_write_slot(volatile uint32_t * volatile *slot) {
+    s_host_monitor_write_slot = slot;
+}
+
+// Generic test-yield hook storage (the hook is declared in functions.h, since
+// the harness binds to the setter).  Lives here, in a firmware source compiled
+// into the test build, following the same pattern as the seams above.
+void (*onerom_test_yield_hook)(void) = NULL;
+
+void set_onerom_test_yield_hook(void (*hook)(void)) {
+    onerom_test_yield_hook = hook;
+}
+#endif // !REAL_HARDWARE
+
+// Hand control to the test harness from inside a busy-wait.
+//
+// Expands to nothing on a device build, so it costs not one instruction in the
+// capture path — a guarantee at every optimisation level, which an empty
+// inline function would leave to the compiler.
+//
+// Only call this where the loop genuinely cannot proceed without more captured
+// data.  Under emulation nothing advances while the firmware runs, so a yield
+// is a one-way handover: the harness takes control, drives the next bus cycle,
+// and moves on.  A yield issued when the loop could have carried on therefore
+// gives away a turn that is never returned, and the firmware ends up running
+// behind the bus the harness thinks it is level with.
+#if !REAL_HARDWARE
+#define ONEROM_TEST_YIELD()                     \
+    do {                                        \
+        if (onerom_test_yield_hook != NULL) {   \
+            onerom_test_yield_hook();           \
+        }                                       \
+    } while (0)
+#else
+#define ONEROM_TEST_YIELD() do { } while (0)
+#endif
+
+// Location holding the address-monitor DMA's current ring write position.
+// The pointed-to value is the current write pointer and advances as the ring
+// fills; the returned slot itself is stable for the monitor's lifetime.
+static inline volatile uint32_t * volatile *monitor_ring_write_pos_slot(void) {
+#if REAL_HARDWARE
+    return (volatile uint32_t * volatile *)&DMA_CH_REG(DMA_CH_ADDR_MONITOR)->write_addr;
+#else
+    return s_host_monitor_write_slot;
+#endif
+}
+
 // GPIOs for X1 and X2 within the address span.  GPIO_NONE when absent.
 typedef struct {
     uint8_t x1_gpio;
@@ -114,9 +183,40 @@ static void pio_setup_address_monitor_pios() {
     // new SM programs written here without disturbing already-running SMs.
     APIO_ASM_CONTINUE();
 
+    // The monitor reuses the ROM serving blocks (keeping the third PIO block
+    // free for user plugins): the CS monitor SM shares the CS/Data block and
+    // the address-read monitor SM shares the address block.  Read both now.
+    uint8_t cs_data_block = GET_PIO_BLOCK_INFO(RUNTIME->cs_data_pio_block_info);
+    uint8_t addr_block = GET_PIO_BLOCK_INFO(RUNTIME->addr_pio_block_info);
+
+    // The CS monitor (built first, below) signals "CS active" to the
+    // address-read monitor SM via ADDR_MONITOR_IRQ.  PIO IRQ flags are
+    // per-block, so when the two SMs are in different blocks the CS monitor
+    // must set the flag in the address block using the cross-instance PREV/NEXT
+    // form.  Derive the direction from the two block numbers so this survives
+    // any future change to the block assignment, and keep the flag in the
+    // (in-use) address block rather than the unused monitor block, so it is
+    // clear which IRQs those blocks consume.
+    uint16_t irq_set_instr;
+    {
+        uint8_t prev = (cs_data_block == 0) ? (uint8_t)(APIO_MAX_PIO_BLOCKS - 1)
+                                            : (uint8_t)(cs_data_block - 1);
+        uint8_t next = (uint8_t)((cs_data_block + 1) % APIO_MAX_PIO_BLOCKS);
+        if (addr_block == cs_data_block) {
+            irq_set_instr = APIO_IRQ_SET(ADDR_MONITOR_IRQ);
+        } else if (addr_block == prev) {
+            irq_set_instr = APIO_IRQ_SET_PREV(ADDR_MONITOR_IRQ);
+        } else if (addr_block == next) {
+            irq_set_instr = APIO_IRQ_SET_NEXT(ADDR_MONITOR_IRQ);
+        } else {
+            ERR("Address/CS monitor blocks %u/%u not adjacent",
+                addr_block, cs_data_block);
+            return;
+        }
+    }
+
     // Use the same block as the ROM serving CS/Data PIO, starting from
     // where it left off
-    uint8_t cs_data_block = GET_PIO_BLOCK_INFO(RUNTIME->cs_data_pio_block_info);
     uint8_t cs_data_sm_pos = GET_PIO_BLOCK_INSTR_LEN(RUNTIME->cs_data_pio_block_info);
     APIO_SET_BLOCK_FROM_VAR(cs_data_block, cs_data_sm_pos);
 
@@ -136,6 +236,9 @@ static void pio_setup_address_monitor_pios() {
     }
     uint8_t base_cs_pin = cs_alg->base_cs_pin;
     uint8_t num_cs_pins = cs_alg->num_cs_pins;
+    // EXECCTRL is zero for the algorithms that reach their verdict from the CS
+    // pins alone; AlgCs2 needs JMP_PIN pointed at its enable line.
+    uint32_t execctrl = 0;
     switch (cs_alg->alg) {
         case ALG_CS_0: {
             // All CS pins contiguous - CS active == zero
@@ -163,7 +266,7 @@ static void pio_setup_address_monitor_pios() {
                 APIO_ADD_INSTR(APIO_JMP_NOT_X(APIO_LABEL(cs_inactive)));
             }
 
-            APIO_ADD_INSTR(APIO_IRQ_SET(ADDR_MONITOR_IRQ));
+            APIO_ADD_INSTR(irq_set_instr);
 
             APIO_LABEL_NEW(cs_active);
             APIO_ADD_INSTR(APIO_MOV_X_PINS);
@@ -206,7 +309,7 @@ static void pio_setup_address_monitor_pios() {
             APIO_ADD_INSTR(APIO_JMP_X_NOT_Y(APIO_LABEL(cs_inactive)));
 
             // cs_active:
-            APIO_ADD_INSTR(APIO_IRQ_SET(ADDR_MONITOR_IRQ));
+            APIO_ADD_INSTR(irq_set_instr);
 
             APIO_WRAP_BOTTOM();
             APIO_LABEL_NEW(test_if_inactive);
@@ -223,15 +326,72 @@ static void pio_setup_address_monitor_pios() {
             break;
         }
 
-        // 23QL384 is not currently supported
-        case ALG_CS_2:
+        case ALG_CS_2: {
+            // Enable + address-qualified select (23QL384).  The chip is
+            // selected when the enable line is asserted AND the qualifier pins
+            // do not match the deselect pattern; the CS-active predicate here
+            // must track the serving SM's, built in setup_serving_pios()
+            // (piorom2.c) - if one changes, so must the other.
+            //
+            // Unlike the serving SM this debounces, as the AlgCs0/AlgCs1
+            // monitors do: four consecutive active samples before an access is
+            // taken as real.  Only the enable is debounced.  The qualifiers are
+            // address lines, which settle ahead of the enable being asserted,
+            // and are read once the enable has held low - so sampling them once
+            // at that point is later, not earlier, than debouncing them.
+            const onerom_alg_cs2_param_t *params =
+                (const onerom_alg_cs2_param_t *)cs_alg->params;
+
+            APIO_WRAP_BOTTOM();
+            APIO_LABEL_NEW(cs_inactive);
+            APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cs_inactive)));
+            APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cs_inactive)));
+            APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cs_inactive)));
+            APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cs_inactive)));
+
+            // Enable held low: selected unless the qualifier pins read the
+            // deselect pattern preloaded into Y.
+            APIO_ADD_INSTR(APIO_MOV_X_PINS);
+            APIO_LABEL_NEW_OFFSET(cs_active, 2);
+            APIO_ADD_INSTR(APIO_JMP_X_NOT_Y(APIO_LABEL(cs_active)));
+            APIO_ADD_INSTR(APIO_JMP(APIO_LABEL(cs_inactive)));
+
+            // cs_active:
+            APIO_ADD_INSTR(irq_set_instr);
+
+            // Hold until the enable is released or the host addresses a
+            // deselected range.  Either way, re-arm through the debounce: a
+            // host that walks the address from a deselected range back into a
+            // selected one, without ever releasing the enable, is a fresh
+            // access and must produce a fresh capture.
+            APIO_LABEL_NEW(cs_active_poll);
+            APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cs_inactive)));
+            APIO_ADD_INSTR(APIO_MOV_X_PINS);
+            APIO_WRAP_TOP();
+            APIO_ADD_INSTR(APIO_JMP_X_NOT_Y(APIO_LABEL(cs_active_poll)));
+
+            // This SM's IN pins are the qualifier span, not the CS range, and
+            // JMP_PIN is the enable line (an offset from gpio_base, as in the
+            // serving SM).  Read base_cs_pin before overwriting it.
+            execctrl = APIO_EXECCTRL_JMP_PIN(cs_alg->base_cs_pin);
+            base_cs_pin = params->base_qualifier_pin;
+            num_cs_pins = params->num_qualifier_pins;
+
+            // Preload Y with the qualifier deselect pattern via TXF rather
+            // than SET_Y, as the pattern may exceed the 5-bit SET immediate.
+            APIO_TXF = params->qualifier_inactive_pattern;
+            APIO_SM_EXEC_INSTR(APIO_PULL_BLOCK);
+            APIO_SM_EXEC_INSTR(APIO_MOV_Y_OSR);
+            break;
+        }
+
         default:
             ERR("Unsupported CS algorithm: %d", cs_alg->alg);
             break;
     }
 
     APIO_SM_CLKDIV_SET(cs_alg->clkdiv_int, cs_alg->clkdiv_frac);
-    APIO_SM_EXECCTRL_SET(0);
+    APIO_SM_EXECCTRL_SET(execctrl);
     APIO_SM_SHIFTCTRL_SET(
         APIO_IN_COUNT(num_cs_pins) |
         APIO_IN_SHIFTDIR_L
@@ -246,20 +406,24 @@ static void pio_setup_address_monitor_pios() {
     //
     // SM 1: Address read monitor
     //
-    uint8_t addr_block = GET_PIO_BLOCK_INFO(RUNTIME->addr_pio_block_info);
     uint8_t addr_sm_pos = GET_PIO_BLOCK_INSTR_LEN(RUNTIME->addr_pio_block_info);
     APIO_SET_BLOCK_FROM_VAR(addr_block, addr_sm_pos);
 
     // There is currently only a single address algorithm
     const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
-    if (cs_alg->gpio_base != addr_alg->gpio_base) {
-        // TODO
-        // This happens for 32 and 40 pin ROMs - needs an enhancement to
-        // add them to the regular PIO blocks.
-        ERR("Address/Data GPIO base mismatch");
-        return;
-    }
     APIO_SET_SM(SM_ADDR_MONITOR_ADDR_READ);
+
+    // Set this block's GPIOBASE from the address algorithm.  It may differ from
+    // the CS/data block's base — 32-pin ROMs carry the address pins in the
+    // upper GPIO bank (base 16) while CS/data stay in the lower bank (base 0).
+    // The two monitor SMs live in separate blocks, so each uses the base
+    // appropriate to the pins it reads; the CS monitor set its block's base
+    // above.
+    if (addr_alg->gpio_base == 0) {
+        APIO_GPIOBASE_0();
+    } else {
+        APIO_GPIOBASE_16();
+    }
 
     APIO_ADD_INSTR(APIO_WAIT_IRQ_HIGH(ADDR_MONITOR_IRQ));
     APIO_WRAP_TOP();
@@ -282,6 +446,20 @@ static void pio_setup_address_monitor_pios() {
     return;
 }
 
+#if REAL_HARDWARE
+// RX FIFO register pointer for an arbitrary PIO block/SM, built on the public
+// per-block APIO macros (block index N addresses APIO instance N).  Used so the
+// address-monitor DMA reads from whichever block the monitor SM actually lives
+// in, rather than a fixed block.
+static inline volatile uint32_t *sm_rxf_ptr(uint8_t block, uint8_t sm) {
+    switch (block) {
+        case 0:  return &APIO0_SM_RXF(sm);
+        case 1:  return &APIO1_SM_RXF(sm);
+        default: return &APIO2_SM_RXF(sm);
+    }
+}
+#endif // REAL_HARDWARE
+
 static void pio_setup_address_monitor_dma(
     uint8_t dma_ch,
     uint8_t block,
@@ -290,7 +468,7 @@ static void pio_setup_address_monitor_dma(
     uint8_t ring_size_log2,
     uint8_t data_size
 ) {
-#if !defined(TEST_BUILD)
+#if REAL_HARDWARE
     uint32_t dma_data_size;
     if (data_size == 8) {
         dma_data_size = DMA_CTRL_TRIG_DATA_SIZE_8BIT;
@@ -300,9 +478,10 @@ static void pio_setup_address_monitor_dma(
         dma_data_size = DMA_CTRL_TRIG_DATA_SIZE_32BIT;
     }
 
-    // SM1 RX FIFO -> ring_buf circular write
+    // SM RX FIFO -> ring_buf circular write.  Read from the block the monitor
+    // address-read SM was placed in, not a fixed block.
     volatile dma_ch_reg_t *dma_reg = DMA_CH_REG(dma_ch);
-    dma_reg->read_addr = (uint32_t)&APIO0_SM_RXF(sm_addr_read);
+    dma_reg->read_addr = (uint32_t)sm_rxf_ptr(block, sm_addr_read);
     dma_reg->write_addr = (uint32_t)ring_buf;
     dma_reg->transfer_count = 0xffffffff;
     dma_reg->ctrl_trig =
@@ -318,10 +497,16 @@ static void pio_setup_address_monitor_dma(
                 sm_addr_read
             )
         );
-#else // TEST_BUILD
-    LOG("DMA setup: ch=%d block=%d sm=%d ring_buf=%p ring_size_log2=%d data_size=%d",
-        dma_ch, block, sm_addr_read, (void *)ring_buf, ring_size_log2, data_size);
-#endif // !TEST_BUILD
+#else // !REAL_HARDWARE
+    // No DMA registers under emulation: hand the block/SM/ring the firmware
+    // chose to the injected configure seam, which wires up epio's capture
+    // channel from that choice (so a wrong block choice is caught).
+    (void)dma_ch;
+    if (s_host_monitor_dma_configure != NULL) {
+        s_host_monitor_dma_configure(block, sm_addr_read, (void *)ring_buf,
+                                     ring_size_log2, data_size);
+    }
+#endif // REAL_HARDWARE
 }
 
 ora_result_t pio_setup_address_monitor(
@@ -349,7 +534,9 @@ ora_result_t pio_setup_address_monitor(
     pio_setup_address_monitor_pios();
     pio_setup_address_monitor_dma(
         DMA_CH_ADDR_MONITOR,
-        BLOCK_MONITOR,
+        // The address-read monitor SM shares the ROM serving address block; the
+        // DMA must drain that block's RX FIFO, not the (unused) monitor block.
+        GET_PIO_BLOCK_INFO(RUNTIME->addr_pio_block_info),
         SM_ADDR_MONITOR_ADDR_READ,
         ring_buf,
         ring_size_log2,
@@ -502,9 +689,13 @@ uint32_t pio_map_addr_to_phys(
             }
             case ALG_CS_2:
             default:
+                // AlgCs2 selects on a single enable line plus address
+                // qualifiers, which cannot express a Multi set's per-chip
+                // select; the generator rejects every Multi combination of the
+                // only chip type that resolves to it (23QL384), so reaching
+                // here means the metadata is inconsistent.
                 ERR("pio_map_addr_to_phys: unsupported CS algorithm %d for "
                     "Multi slot", cs_alg->alg);
-                // TODO: implement AlgCs2 Multi support
                 break;
         }
     }
@@ -564,20 +755,17 @@ uint32_t pio_map_data_to_phys(
     return physical;
 }
 
-// Converts a ring buffer entry (post-override PIO-visible GPIO bitmap) to a
-// logical address, with optional control pin activity checking.
+// pio_demangle_observed_addr: converts a ring buffer entry (post-override
+// PIO-visible GPIO bitmap) to the address observed on the device's address
+// lines, with optional control pin activity checking.  This is the body shared
+// with pio_demangle_addr, which wraps it with the 16-bit A-1 fold; see the ORA
+// API docs (ora_demangle_observed_addr_fn_t / ora_demangle_addr_fn_t) for the
+// observed-vs-logical-byte-address distinction.
 //
 // physical_addr is post-override: PIOs always read post-override values from
-// IN PINS, so ring buffer entries already reflect PIO-visible values.
-//
-// Word size and A-1 (mirror of pio_map_addr_to_phys):
-//   word_size == 16: the table index is (word_scatter << 1) | A-1, where
-//                    A-1 (the byte-within-word select) is the LSB and is NOT
-//                    a scattered GPIO in addr[].  This function pulls A-1 off
-//                    bit 0, shifts the scattered word address down by one so
-//                    the addr[] extraction sees the word index in its
-//                    original GPIO bit positions, then re-applies A-1 as the
-//                    logical LSB.  word_size == 8: physical_addr is used as-is.
+// IN PINS, so ring buffer entries already reflect PIO-visible values.  Address
+// bits are extracted from pin_map->addr[] at their raw GPIO bit positions (no
+// A-1 fold), which is the value present on the observed lines.
 //
 // Control pin check (check_control_pins != 0):
 //   AlgCs0, Single/Banked: verify all CS pins are in the active-low state (0).
@@ -585,9 +773,10 @@ uint32_t pio_map_data_to_phys(
 //                          verify X pins are inactive (0).
 //   AlgCs1, Single/Banked: verify real CS pins (excluding cs_ignore_index)
 //                          are in the active-low state (0).
-//   AlgCs2:                not currently supported; returns ORA_RESULT_ERROR.
-//                          TODO: implement when AlgCs2 address monitor support
-//                          is added.
+//   AlgCs2, Single/Banked: verify the enable line is active-low (0), then that
+//                          the qualifier field does not read the deselect
+//                          pattern (which would mean the host addressed a range
+//                          the chip does not serve).
 //
 // Address extraction:
 //   NORMAL:     logical bit = physical bit.
@@ -595,7 +784,7 @@ uint32_t pio_map_data_to_phys(
 //               invert to recover original chip pin value).
 //   GPIO_OVER_LOW:  logical bit = 0 (forced; carries no information).
 //   GPIO_OVER_HIGH: logical bit = 1.
-ora_result_t pio_demangle_addr(
+ora_result_t pio_demangle_observed_addr(
     const onerom_rom_slot_t *slot,
     uint32_t physical_addr,
     uint32_t *logical_addr_out,
@@ -606,25 +795,9 @@ ora_result_t pio_demangle_addr(
     }
 
     const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
-    const onerom_alg_data_config_t *data_alg = slot->alg->alg_data;
     const onerom_alg_cs_config_t   *cs_alg   = slot->alg->alg_cs;
     const onerom_rom_pin_map_t     *pin_map   = slot->roms[0]->pin_map;
     uint8_t addr_base = addr_alg->gpio_base + addr_alg->base_addr_pin;
-
-    // 16-bit serving: pio_map_addr_to_phys built the table index as
-    // (word_scatter << 1) | A-1, where A-1 (the byte-within-word select) is
-    // the least-significant bit and is NOT a scattered GPIO in addr[].
-    // Reverse that here: pull A-1 off bit 0, then shift the scattered word
-    // address down by one so the addr[] extraction below (and the control-
-    // pin checks, which read the same shifted frame) see the word index in
-    // its original GPIO bit positions.  A-1 is re-applied as the logical
-    // LSB at the end.
-    uint8_t  word_size = data_alg->word_size;
-    uint32_t a_minus_1 = 0;
-    if (word_size == 16u) {
-        a_minus_1     = physical_addr & 1u;
-        physical_addr = physical_addr >> 1;
-    }
 
     if (check_control_pins) {
         switch (cs_alg->alg) {
@@ -726,7 +899,59 @@ ora_result_t pio_demangle_addr(
                 break;
             }
 
-            case ALG_CS_2:
+            case ALG_CS_2: {
+                // Enable + address-qualified select.  Two conditions, matching
+                // the CS monitor SM: the enable line must be asserted (active
+                // low, like AlgCs1), and the qualifier field must not read the
+                // deselect pattern.
+                const onerom_alg_cs2_param_t *cs_params =
+                    (const onerom_alg_cs2_param_t *)cs_alg->params;
+
+                uint8_t enable_gpio = cs_alg->gpio_base + cs_alg->base_cs_pin;
+                uint8_t bit_pos     = enable_gpio - addr_base;
+                uint8_t override    = v2_get_gpio_override(slot, enable_gpio);
+
+                switch (override) {
+                    case GPIO_OVER_NORMAL:
+                    case GPIO_OVER_INVERT:
+                        if ((uint8_t)((physical_addr >> bit_pos) & 1u) != 0u) {
+                            return ORA_RESULT_CONTROL_PIN_ACTIVE;
+                        }
+                        break;
+                    case GPIO_OVER_LOW:
+                        /* forced to 0 = active; always passes */
+                        break;
+                    case GPIO_OVER_HIGH:
+                        /* forced to 1 = inactive; always fails */
+                        return ORA_RESULT_CONTROL_PIN_ACTIVE;
+                    default:
+                        break;
+                }
+
+                // The qualifier field is compared whole, exactly as the PIO
+                // compares it against Y - the pattern is expressed over the
+                // whole span, so any non-qualifier GPIO inside it carries a 0.
+                // The only such GPIO is the enable line (on fire-28-c/d it sits
+                // between the two qualifier pins), which the check above has
+                // already established reads 0 here.  Rebase the span from
+                // gpio_base to the captured entry's own base to line the two
+                // up.
+                uint8_t qual_gpio = cs_alg->gpio_base
+                                  + cs_params->base_qualifier_pin;
+                uint8_t qual_shift = qual_gpio - addr_base;
+                uint32_t qual_mask =
+                    (cs_params->num_qualifier_pins >= 32u)
+                        ? 0xFFFFFFFFu
+                        : ((1u << cs_params->num_qualifier_pins) - 1u);
+                uint32_t qual_field = (physical_addr >> qual_shift) & qual_mask;
+
+                if (qual_field == (uint32_t)cs_params->qualifier_inactive_pattern) {
+                    // Deselected address range - the chip served nothing here.
+                    return ORA_RESULT_CONTROL_PIN_ACTIVE;
+                }
+                break;
+            }
+
             default:
                 ERR("pio_demangle_addr: unsupported CS algorithm %d",
                     cs_alg->alg);
@@ -765,16 +990,52 @@ ora_result_t pio_demangle_addr(
         }
     }
 
-    // 16-bit: re-apply A-1 as the logical LSB, shifting the recovered word
-    // address up by one (inverse of the split at the top of this function).
-    if (word_size == 16u) {
-        logical = (logical << 1) | a_minus_1;
-    }
-
     *logical_addr_out = logical;
     return ORA_RESULT_OK;
 }
- 
+
+// Wraps pio_demangle_observed_addr with the 16-bit A-1 fold so the result is
+// the logical byte address (the inverse of pio_map_addr_to_phys), rather than
+// the observed bus address.  For word_size == 8 the two are identical.  This is
+// the cold path (inverse-of-map use); pio_demangle_observed_addr is the hot
+// path used to decode address-monitor captures.
+ora_result_t pio_demangle_addr(
+    const onerom_rom_slot_t *slot,
+    uint32_t physical_addr,
+    uint32_t *logical_addr_out,
+    uint8_t check_control_pins
+) {
+    uint8_t  word_size = slot->alg->alg_data->word_size;
+    uint32_t a_minus_1 = 0;
+    if (word_size == 16u) {
+        a_minus_1     = physical_addr & 1u;
+        physical_addr = physical_addr >> 1;
+    }
+    ora_result_t r = pio_demangle_observed_addr(
+        slot, physical_addr, logical_addr_out, check_control_pins);
+    if (r == ORA_RESULT_OK && word_size == 16u) {
+        *logical_addr_out = (*logical_addr_out << 1) | a_minus_1;
+    }
+    return r;
+}
+
+// Number of least-significant logical-address bits the device does not observe
+// on its monitored address lines for this ROM: num_rom_table_bits (the full
+// logical byte-address width) minus num_addr_pins (the observed lines).  0 on
+// 24/28/32-pin variants, 1 on the 40-pin variant.  See
+// ora_get_unobserved_addr_bits_fn_t.
+ora_result_t pio_get_unobserved_addr_bits(
+    const onerom_rom_slot_t *slot,
+    uint8_t *bits_out
+) {
+    if (bits_out == NULL) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+    const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
+    *bits_out = (uint8_t)(addr_alg->num_rom_table_bits - addr_alg->num_addr_pins);
+    return ORA_RESULT_OK;
+}
+
 // ---------------------------------------------------------------------------
 // pio_demangle_data
 // ---------------------------------------------------------------------------
@@ -834,9 +1095,6 @@ uint8_t pio_demangle_data(
 // debounce filtering.
 //
 // X mask (Multi only): bit positions of X pins within the address span.
-//
-// AlgCs2 is not currently supported; returns ORA_RESULT_ERROR.
-// TODO: implement AlgCs2 support.
 ora_result_t pio_init_knock(
     const uint32_t *knock_seq,
     uint8_t         knock_len,
@@ -936,11 +1194,19 @@ ora_result_t pio_init_knock(
             }
             break;
         }
-        case ALG_CS_2:
+        case ALG_CS_2: {
+            // The enable line only.  The qualifier pins are address lines, and
+            // masking those would remove address bits from the debounce test.
+            uint8_t g = cs_alg->gpio_base + cs_alg->base_cs_pin;
+            if (g >= addr_base &&
+                g < (uint8_t)(addr_base + addr_alg->num_addr_pins)) {
+                cs_mask |= (1u << (g - addr_base));
+            }
+            break;
+        }
         default:
             ERR("pio_init_knock: unsupported CS algorithm %d", cs_alg->alg);
             return ORA_RESULT_ERROR;
-            // TODO: implement AlgCs2 support
     }
  
     // X mask (Multi only).
@@ -1029,7 +1295,6 @@ ora_result_t pio_read_ram_rom_slot(
     return ORA_RESULT_OK;
 }
 
-#if !defined(TEST_BUILD)
 __attribute__((always_inline)) static inline uint8_t debounce(
     uint32_t entry,
     const ora_knock_t *knock
@@ -1045,15 +1310,13 @@ __attribute__((always_inline)) static inline uint8_t debounce(
     if (knock->x_mask && (entry & knock->x_mask)) return 1;     // X pin active
     return 0;
 }
-#endif // !TEST_BUILD
 
 // Written as a macro to allow multiple data sizes
 #define KNOCK_DETECT_LOOP(TYPE) do {                                        \
     volatile TYPE *rp = (volatile TYPE *)read_ptr;                          \
     volatile TYPE *rb = (volatile TYPE *)ring_buf;                          \
     while (knock_pos < knock->len) {                                        \
-        volatile TYPE *wp = (volatile TYPE *)                               \
-            DMA_CH_REG(DMA_CH_ADDR_MONITOR)->write_addr;                    \
+        volatile TYPE *wp = (volatile TYPE *)*monitor_ring_write_pos_slot(); \
         while (rp != wp) {                                                  \
             uint32_t entry = (uint32_t)*rp;                                 \
             if (++rp >= rb + ring_entries) rp = rb;                         \
@@ -1068,6 +1331,13 @@ __attribute__((always_inline)) static inline uint8_t debounce(
                     ? 1 : 0;                                                \
             }                                                               \
         }                                                                   \
+        /* The inner loop exits either because the ring is drained or       \
+           because the knock completed.  Only the first needs more captured \
+           data; yielding on the second would give away a turn we do not    \
+           need.  See ONEROM_TEST_YIELD. */                                 \
+        if (knock_pos < knock->len) {                                       \
+            ONEROM_TEST_YIELD();                                            \
+        }                                                                   \
     }                                                                       \
     read_ptr = (volatile uint32_t *)rp;                                     \
 } while (0)
@@ -1076,8 +1346,7 @@ __attribute__((always_inline)) static inline uint8_t debounce(
     volatile TYPE *rp = (volatile TYPE *)read_ptr;                          \
     volatile TYPE *rb = (volatile TYPE *)ring_buf;                          \
     while (payload_pos < payload_len) {                                     \
-        volatile TYPE *wp = (volatile TYPE *)                               \
-            DMA_CH_REG(DMA_CH_ADDR_MONITOR)->write_addr;                    \
+        volatile TYPE *wp = (volatile TYPE *)*monitor_ring_write_pos_slot(); \
         while (rp != wp && payload_pos < payload_len) {                     \
             uint32_t entry = (uint32_t)*rp;                                 \
             if (++rp >= rb + ring_entries) rp = rb;                         \
@@ -1085,6 +1354,11 @@ __attribute__((always_inline)) static inline uint8_t debounce(
                 if (debounce(entry, knock)) continue;                       \
             }                                                               \
             payload_out[payload_pos++] = entry;                             \
+        }                                                                   \
+        /* As above: yield only when the ring ran dry, not when the payload \
+           is complete and we are ready to run the command. */              \
+        if (payload_pos < payload_len) {                                    \
+            ONEROM_TEST_YIELD();                                            \
         }                                                                   \
     }                                                                       \
     read_ptr = (volatile uint32_t *)rp;                                     \
@@ -1100,10 +1374,9 @@ ora_result_t pio_wait_for_knock(
     volatile uint32_t *start_pos,
     volatile uint32_t **next_read_out
 ) {
-#if !defined(TEST_BUILD)
     // Discard any captures that occurred before we were called.  Do this first
     // to avoid missing bytes, even before testing for a start_pos.
-    volatile uint32_t *read_ptr = (volatile uint32_t *)DMA_CH_REG(DMA_CH_ADDR_MONITOR)->write_addr;
+    volatile uint32_t *read_ptr = (volatile uint32_t *)*monitor_ring_write_pos_slot();
     if (start_pos != NULL) {
         // We have a start_pos so use that instead.
         read_ptr = start_pos;
@@ -1140,17 +1413,6 @@ ora_result_t pio_wait_for_knock(
         *next_read_out = read_ptr;
     }
     return ORA_RESULT_OK;
-#else // TEST_BUILD
-    (void)knock;
-    (void)ring_buf;
-    (void)ring_entries_log2;
-    (void)flags;
-    (void)payload_out;
-    (void)payload_len;
-    (void)start_pos;
-    (void)next_read_out;
-    return ORA_RESULT_OK;
-#endif // !TEST_BUILD
 }
 
 ora_result_t pio_reprogram_ram_rom_slot(
@@ -1201,14 +1463,39 @@ ora_result_t pio_reprogram_ram_rom_slot(
     return ORA_RESULT_OK;
 }
 
+// SM-enable masks for the two serving blocks the monitor SMs share.  Because
+// APIO_ENABLE_SMS writes the whole SM-enable field, each mask must include the
+// serving SMs already running in that block plus the monitor SM enabled here;
+// re-enabling an already-running SM leaves it undisturbed.
+#define MON_ADDR_BLOCK_SMS \
+    ((1u << SM_ADDR_READ) | (1u << SM_ADDR_MONITOR_ADDR_READ))
+#define MON_CS_BLOCK_SMS \
+    ((1u << SM_DATA_OUTPUT) | (1u << SM_DATA_WRITE) | (1u << SM_ADDR_MONITOR_CS_MONITOR))
+
+// APIO_ENABLE_SMS requires a compile-time block; dispatch on the runtime block
+// so the monitor follows the serving blocks wherever they are assigned.
+#define ENABLE_SMS_IN_BLOCK(block, mask) do {           \
+    switch (block) {                                    \
+        case 0:  { APIO_ENABLE_SMS(0, (mask)); } break; \
+        case 1:  { APIO_ENABLE_SMS(1, (mask)); } break; \
+        default: { APIO_ENABLE_SMS(2, (mask)); } break; \
+    }                                                   \
+} while (0)
+
 ora_result_t pio_start_address_monitor(void) {
-    APIO_ENABLE_SMS(BLOCK_MONITOR, ((1 << SM_ADDR_MONITOR_CS_MONITOR) | (1 << SM_ADDR_MONITOR_ADDR_READ)));
+    // The monitor SMs live in the serving blocks (see
+    // pio_setup_address_monitor_pios), so enable each in its own block rather
+    // than in the unused monitor block.
+    uint8_t addr_block = GET_PIO_BLOCK_INFO(RUNTIME->addr_pio_block_info);
+    uint8_t cs_block   = GET_PIO_BLOCK_INFO(RUNTIME->cs_data_pio_block_info);
+    ENABLE_SMS_IN_BLOCK(addr_block, MON_ADDR_BLOCK_SMS);
+    ENABLE_SMS_IN_BLOCK(cs_block, MON_CS_BLOCK_SMS);
 
     return ORA_RESULT_OK;
 }
 
 volatile uint32_t * volatile *pio_get_address_monitor_ring_write_pos(void) {
-    return (volatile uint32_t * volatile *)&DMA_CH_REG(DMA_CH_ADDR_MONITOR)->write_addr;
+    return monitor_ring_write_pos_slot();
 }
 
 // Returns the number of bits used to index the ROM table — i.e. the low bits

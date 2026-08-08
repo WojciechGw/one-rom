@@ -54,6 +54,7 @@ void setup_mco(void);
 uint32_t setup_sel_pins(uint64_t *sel_mask, uint64_t *flip_bits);
 uint64_t get_sel_value(uint64_t sel_mask, uint64_t flip_bits);
 void disable_sel_pins(void);
+void disable_swd(void);
 void setup_status_led(void);
 void blink_pattern(uint32_t on_time, uint32_t off_time, uint8_t repeats);
 void enter_bootloader(void);
@@ -87,6 +88,16 @@ ora_result_t pio_demangle_addr(
     uint32_t physical_addr,
     uint32_t *logical_addr_out,
     uint8_t check_control_pins
+);
+ora_result_t pio_demangle_observed_addr(
+    const onerom_rom_slot_t *slot,
+    uint32_t physical_addr,
+    uint32_t *logical_addr_out,
+    uint8_t check_control_pins
+);
+ora_result_t pio_get_unobserved_addr_bits(
+    const onerom_rom_slot_t *slot,
+    uint8_t *bits_out
 );
 uint8_t pio_demangle_data(
     const onerom_rom_slot_t *slot,
@@ -130,6 +141,11 @@ ora_result_t pio_read_ram_rom_slot(
     uint32_t  len
 );
 uint8_t pio_get_active_ram_slot(void);
+ora_result_t pio_get_gpio_use(
+    const onerom_rom_slot_t *slot,
+    uint8_t gpio,
+    uint8_t *use_out
+);
 
 // plugin.c
 uint8_t check_plugin_valid(
@@ -150,6 +166,38 @@ uint8_t *sram_to_host(uint32_t addr);
 // backing store with epio's, so subsequent firmware writes are immediately
 // visible to the running epio simulation.
 void set_host_sram_ptr(uint8_t *ptr);
+
+// Address-monitor emulation seams (see pioplugin.c).  There are no DMA
+// registers under emulation, so the firmware routes the address-monitor DMA
+// configuration and ring-write-position reads through injected hooks that the
+// test harness wires to epio's capture channel.
+typedef void (*monitor_dma_configure_fn_t)(
+    uint8_t src_block,
+    uint8_t src_sm,
+    void *ring_buf,
+    uint8_t ring_size_log2,
+    uint8_t data_size
+);
+// Sets the callback pio_setup_address_monitor_dma invokes with the block/SM/
+// ring it chose, so the harness can configure epio's capture channel from the
+// firmware's own choice.
+void set_host_monitor_dma_configure(monitor_dma_configure_fn_t fn);
+// Sets the slot the firmware reads the address-monitor ring write position
+// from; point it at epio's live capture write pointer.
+void set_host_monitor_write_slot(volatile uint32_t * volatile *slot);
+
+// Generic test-yield hook.  The harness installs a callback here, which the
+// firmware invokes at points where it would otherwise busy-wait on hardware
+// the emulator drives, giving the harness a chance to advance the simulation.
+//
+// Only the hook itself is declared here, because the harness binds to the
+// setter.  The ONEROM_TEST_YIELD() invocation is a macro, private to the
+// source that busy-waits (pioplugin.c) — a seam used in one file does not
+// belong in every translation unit, and a macro is guaranteed to vanish on a
+// device build at any optimisation level, where an empty inline function is
+// only expected to.
+extern void (*onerom_test_yield_hook)(void);
+void set_onerom_test_yield_hook(void (*hook)(void));
 #endif // !REAL_HARDWARE
 
 // pio/dma.c

@@ -115,7 +115,11 @@ pub fn build_rom_slot(
     let bit_mode = bit_mode_for(chip_types[0], board);
 
     let multi_cs_config: Option<MultiChipCsConfig> = if set_type == ChipSetType::Multi {
-        Some(derive_multi_cs_config(chips))
+        Some(derive_multi_cs_config(
+            chip_types[0],
+            chips[0].cs_config(),
+            chips[1].cs_config(),
+        ))
     } else {
         None
     };
@@ -214,10 +218,12 @@ mod tests {
             None,
             Some(image.as_slice()),
             vec![0u8; ChipType::Chip2364.size_bytes()],
-            &ChipType::Chip2364,
+            &ChipType::Chip2364.into(),
             cs_config,
             &SizeHandling::None,
+            crate::PAD_BLANK_BYTE,
             None,
+            &[],
         )
         .expect("chip construction should succeed");
 
@@ -312,6 +318,7 @@ mod tests {
 
     /// End-to-end: Fire28A, single 23QL384, CS1 ActiveLow.
     #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
     fn fire28a_23ql384_single() {
         let cs_config = CsConfig::new(Some(CsLogic::ActiveLow), None, None, None);
         let image = vec![0u8; ChipType::Chip23QL384.size_bytes()]; // 49152 bytes
@@ -322,10 +329,12 @@ mod tests {
             None,
             Some(image.as_slice()),
             vec![0u8; ChipType::Chip23QL384.size_bytes()],
-            &ChipType::Chip23QL384,
+            &ChipType::Chip23QL384.into(),
             cs_config,
             &SizeHandling::None,
+            crate::PAD_BLANK_BYTE,
             None,
+            &[],
         )
         .expect("chip construction should succeed");
 
@@ -393,6 +402,7 @@ mod tests {
 
     /// End-to-end sentinel: Fire28C, 2-chip Banked 27128, CS1 ActiveLow.
     #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
     fn fire28c_27128_banked_2chip() {
         let image = vec![0u8; ChipType::Chip27128.size_bytes()];
 
@@ -402,10 +412,12 @@ mod tests {
             None,
             Some(image.as_slice()),
             vec![0u8; ChipType::Chip27128.size_bytes()],
-            &ChipType::Chip27128,
+            &ChipType::Chip27128.into(),
             CsConfig::new(Some(CsLogic::ActiveLow), None, None, None),
             &SizeHandling::None,
+            crate::PAD_BLANK_BYTE,
             None,
+            &[],
         )
         .expect("chip 0 construction should succeed");
 
@@ -415,10 +427,12 @@ mod tests {
             None,
             Some(image.as_slice()),
             vec![0u8; ChipType::Chip27128.size_bytes()],
-            &ChipType::Chip27128,
+            &ChipType::Chip27128.into(),
             CsConfig::new(Some(CsLogic::ActiveLow), None, None, None),
             &SizeHandling::None,
+            crate::PAD_BLANK_BYTE,
             None,
+            &[],
         )
         .expect("chip 1 construction should succeed");
 
@@ -485,10 +499,12 @@ mod tests {
                 None,
                 Some(image.as_slice()),
                 vec![0u8; ChipType::Chip23QL512.size_bytes()],
-                &ChipType::Chip23QL512,
+                &ChipType::Chip23QL512.into(),
                 cs_config,
                 &SizeHandling::None,
+                crate::PAD_BLANK_BYTE,
                 None,
+                &[],
             )
             .expect("chip construction should succeed")
         };

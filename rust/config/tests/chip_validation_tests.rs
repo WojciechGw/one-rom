@@ -32,7 +32,6 @@ mod tests {
             deselect_when_address_all_high: None,
             allow_mixed_control: false,
             rbcp_chip_type: 0,
-            rbcp_alias: false,
         }
     }
 
@@ -81,7 +80,6 @@ mod tests {
             deselect_when_address_all_high: None,
             allow_mixed_control: false,
             rbcp_chip_type: 11,
-            rbcp_alias: false,
         }
     }
 

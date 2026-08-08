@@ -23,7 +23,7 @@ fn chip_type_from_config(config: &Config, set_idx: usize) -> Result<ChipType, St
         .chip_sets
         .get(set_idx)
         .and_then(|s| s.chips.first())
-        .map(|c| c.chip_type)
+        .map(|c| c.chip_type.resolved())
         .ok_or_else(|| format!("config has no chip set {} (or it has no chips)", set_idx))
 }
 
@@ -91,7 +91,7 @@ pub fn test_flash_slot_info(emu: &Emulator, config: &Config) -> Result<(), Strin
 
     for (i, chip_set) in config.chip_sets.iter().enumerate() {
         let expected_chip_type = match chip_set.chips.first() {
-            Some(c) => c.chip_type,
+            Some(c) => c.chip_type.resolved(),
             None => {
                 errors.push(format!("slot {}: config chip set has no chips", i));
                 continue;
@@ -150,17 +150,108 @@ pub fn test_flash_slot_info(emu: &Emulator, config: &Config) -> Result<(), Strin
     }
 }
 
+/// Verify per-ROM extended info (`ORA_ID_GET_FLASH_SLOT_EXT_INFO`) against
+/// config ground truth.
+///
+/// The key check is that `rom_type` is the exact string the user specified
+/// (e.g. `27LC512`, not the canonical `27512`) — this is the only ORA path that
+/// exposes that string. Also cross-checks the RBCP value and that an
+/// out-of-range `rom_index` is rejected.
+pub fn test_flash_slot_ext_info(emu: &Emulator, config: &Config) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    for (i, chip_set) in config.chip_sets.iter().enumerate() {
+        for (rom_index, chip) in chip_set.chips.iter().enumerate() {
+            let (result, info) = emu.get_flash_slot_ext_info(
+                i as u8,
+                rom_index as u8,
+                ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS,
+            );
+            if !result.is_ok() {
+                errors.push(format!(
+                    "slot {} rom {}: get_flash_slot_ext_info failed: {:?}",
+                    i, rom_index, result
+                ));
+                continue;
+            }
+            let info = match info {
+                Some(info) => info,
+                None => {
+                    errors.push(format!(
+                        "slot {} rom {}: no ext info returned",
+                        i, rom_index
+                    ));
+                    continue;
+                }
+            };
+
+            // The exact user-specified spelling must round-trip verbatim.
+            let expected_raw = chip.chip_type.raw();
+            match info.rom_type.and_then(|s| s.to_str().ok()) {
+                Some(actual) if actual == expected_raw => {}
+                Some(actual) => errors.push(format!(
+                    "slot {} rom {}: rom_type string mismatch: API={:?} config={:?}",
+                    i, rom_index, actual, expected_raw
+                )),
+                None => errors.push(format!(
+                    "slot {} rom {}: rom_type string missing or not valid UTF-8",
+                    i, rom_index
+                )),
+            }
+
+            // Cross-check the RBCP value resolves back to the same chip type.
+            match ChipType::try_from_rbcp_u8(info.rbcp_rom_type as u8) {
+                Some(t) if t == chip.chip_type.resolved() => {}
+                Some(t) => errors.push(format!(
+                    "slot {} rom {}: rbcp type mismatch: API={} config={}",
+                    i,
+                    rom_index,
+                    t.name(),
+                    chip.chip_type.resolved().name()
+                )),
+                None => errors.push(format!(
+                    "slot {} rom {}: rbcp_rom_type {} is not a valid ChipType",
+                    i, rom_index, info.rbcp_rom_type
+                )),
+            }
+        }
+
+        // An out-of-range rom_index must be rejected, not silently accepted.
+        let (result, _) = emu.get_flash_slot_ext_info(
+            i as u8,
+            chip_set.chips.len() as u8,
+            ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS,
+        );
+        if result.is_ok() {
+            errors.push(format!(
+                "slot {}: get_flash_slot_ext_info accepted out-of-range rom_index {}",
+                i,
+                chip_set.chips.len()
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        println!("  {} flash slot(s) ext-verified", config.chip_sets.len());
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 // ── RAM slot tests ────────────────────────────────────────────────────────────
 
 /// Verify RAM slot count against the value derived from the booted image's
 /// gen-computed region size.
 ///
-/// The expected count mirrors ora_get_ram_slot_count in the firmware, keyed on
-/// the SRAM region size:
-///   region ≤ 64KB  → 7
-///   region ≤ 128KB → 3
-///   region ≤ 256KB → 2
-///   region > 256KB → 1
+/// A RAM slot is exactly one ROM region — that is what makes it servable — so
+/// the count is however many regions fit in the RAM reserved for them, capped
+/// at what a one-byte slot index can carry.
+///
+/// This used to be a table keyed on the region size, capped at 7 so that a slot
+/// would be at least 64KB.  That cap could not do what it was for: a slot has
+/// to be the size of the ROM being served, so with a small ROM it only threw
+/// slots away.  A 2316 now yields 255 slots of 2KB rather than 7 of 2KB.
 ///
 /// The region size comes from the same onerom_gen pipeline the firmware uses
 /// (via expected_rom_slot_size), so chips with address-pin gaps (e.g. 231024,
@@ -178,16 +269,15 @@ pub fn test_ram_slot_count(
     let chip_type = chip_type_from_config(config, set_idx)?;
     let actual = emu.get_ram_slot_count();
 
+    /// Bytes the linker reserves for RAM slots — `_Ram_Rom_Image_Size` in
+    /// `firmware/link/linker.ld`, and `RAM_ROM_TABLE_SIZE` in the test stub.
+    const RAM_ROM_IMAGE_SIZE: u32 = 512 * 1024;
+    /// A slot index travels in one byte, and RBCP reserves 0xFF for "no slot is
+    /// active" — `ORA_MAX_RAM_SLOTS` in `firmware/ora/api.h`.
+    const MAX_SLOTS: u32 = 255;
+
     let region_size = expected_rom_slot_size(config, board, fw_version, base_dir, set_idx)?;
-    let expected = if region_size <= 64 * 1024 {
-        7u8
-    } else if region_size <= 128 * 1024 {
-        3
-    } else if region_size <= 256 * 1024 {
-        2
-    } else {
-        1
-    };
+    let expected = (RAM_ROM_IMAGE_SIZE / region_size).clamp(1, MAX_SLOTS) as u8;
 
     if actual != expected {
         return Err(format!(
@@ -212,7 +302,7 @@ pub fn test_ram_slot_count(
 ///   and every RAM slot is of that type — so all slots report it, not just the
 ///   active one.
 /// - Slot 0: addr must be non-zero (region base).
-/// - Slots 1..: addr must be sequential (addr[i] = addr[0] + i * size).
+/// - Slots 1..: addr must be sequential (`addr[i]` = `addr[0]` + i * size).
 /// - Slot >= count: must return ORA_RESULT_INVALID_SLOT.
 pub fn test_ram_slot_info(
     emu: &Emulator,
@@ -343,7 +433,7 @@ pub fn test_read_initial_slot(
         .chips
         .first()
         .ok_or_else(|| format!("chip set {} has no chips", set_idx))?;
-    let chip_type = chip_config.chip_type;
+    let chip_type = chip_config.chip_type.resolved();
 
     let expected = onerom_fw_tester::oracle::load(chip_config, chip_type, base_dir);
     let chip_size = expected.len();

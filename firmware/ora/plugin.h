@@ -100,7 +100,7 @@
  * - There are two types of plugins available - system and user.  See system.h
  *   for more details, but in summary each must be installed in the correct
  *   image slot on flash using One ROM's config JSON file, and system is
- *   reserved for offical One ROM plugins, such as One ROM's built-in USB
+ *   intended to be for offical One ROM plugins, such as One ROM's built-in USB
  *   stack.
  * 
  * - You have access to all of the RP2350 registers, but accessing these
@@ -162,7 +162,7 @@
         ora_plugin_type_t plugin_type, \
         const ora_entry_args_t *entry_args \
     ); \
-    __attribute__((section(".plugin_header"))) \
+    ORA_SECTION(".plugin_header") \
     const ora_plugin_header_t ora_plugin_header = { \
         .magic    = ORA_PLUGIN_MAGIC, \
         .api_version  = ORA_PLUGIN_VERSION_1, \

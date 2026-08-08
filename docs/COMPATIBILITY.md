@@ -1,4 +1,4 @@
-# One ROM Chip Compatibility — firmware v0.7.0
+# One ROM Chip Compatibility — firmware v0.7.1
 
 This document shows which chips each One ROM Fire hardware variant emulates.
 
@@ -11,6 +11,8 @@ One ROM typically has a 2MB flash, with 64KB reserved for the firmware and metad
 Some lower pin count ROMs can be emulated by larger One ROMs, by inserting the larger One ROM in the smaller socket, with the top pins (1, 2, ...) hanging out (and it is not necessary to solder these pins to One ROM if using like this). If doing this, it is _extremely_ important that power is rerouted to One ROM's VCC pin, or to the 5V header pin, or One ROM may be damaged.
 
 Some greater pin count ROMs can be emulated by a smaller One ROM, provided the ROM's extra address pins fall on socket positions that One ROM does not use. In this case, the smaller One ROM gets installed to the bottom of the larger socket, with the top pins of the socket unpopulated. A short fly-lead must be run from each additional address pin of those socket pins to the X1 (and, if two are needed, X2) header pin on One ROM.
+
+**Every image size below assumes One ROM monitors all of the chip's control lines** — every chip select, or /CE and /OE — which is what the tools produce unless told otherwise. A chip that One ROM can only serve with one of those lines left unmonitored is shown as unsupported here, because doing that requires the `allow_cs_ignore` config option and cannot be expressed on the `onerom` command line at all.
 
 | Cell | Meaning |
 |:---|:---|
@@ -26,12 +28,13 @@ Some greater pin count ROMs can be emulated by a smaller One ROM, provided the R
 | Chip | ROM size | 24A | 24B | 24C | 24D | 24E | 24F |
 |:---|---:|---:|---:|---:|---:|---:|---:|
 | 2704 | 512B | 2KB | 2KB | 512B | 512B | 512B | 512B |
-| HM7641 | 512B | - | - | 512B | 512B | 512B | 512B |
+| HM7641 | 512B | 2KB | 2KB | 512B | 512B | 512B | 512B |
 | 2708 | 1KB | 4KB | 4KB | 1KB | 1KB | 1KB | 1KB |
 | 2316 | 2KB | 32KB | 32KB | 2KB | 2KB | 2KB | 2KB |
 | 2716 | 2KB | 32KB | 32KB | 2KB | 2KB | 2KB | 2KB |
 | 28C16 | 2KB | 32KB | 32KB | 2KB | 2KB | 2KB | 2KB |
 | 9316 | 2KB | 32KB | 32KB | 2KB | 2KB | 2KB | 2KB |
+| 9316A | 2KB | 32KB | 32KB | 2KB | 2KB | 2KB | 2KB |
 | 2332 | 4KB | 64KB | 64KB | 8KB | 8KB | 8KB | 8KB |
 | 2732 | 4KB | 32KB | 32KB | 4KB | 4KB | 4KB | 4KB |
 | 27C32 | 4KB | 32KB | 32KB | 4KB | 4KB | 4KB | 4KB |
@@ -93,16 +96,12 @@ Some greater pin count ROMs can be emulated by a smaller One ROM, provided the R
 | Chip | ROM size | 28A | 28B | 28C | 28D |
 |:---|---:|---:|---:|---:|---:|
 | 2704 | 512B | 4KB* | 4KB* | 4KB* | 4KB* |
+| HM7641 | 512B | - | - | 4KB* | 4KB* |
 | 2708 | 1KB | 16KB* | 16KB* | 8KB* | 8KB* |
-| 2316 | 2KB | 32KB* | 32KB* | 32KB* | 32KB* |
 | 2716 | 2KB | 32KB* | 32KB* | 32KB* | 32KB* |
 | 28C16 | 2KB | 32KB* | 32KB* | 32KB* | 32KB* |
-| 9316 | 2KB | 32KB* | 32KB* | 32KB* | 32KB* |
-| 2332 | 4KB | 128KB* | 128KB* | 256KB* | 256KB* |
 | 2732 | 4KB | 32KB* | 32KB* | 32KB* | 32KB* |
 | 27C32 | 4KB | 32KB* | 32KB* | 32KB* | 32KB* |
-| 4732 | 4KB | 128KB* | 128KB* | 256KB* | 256KB* |
-| 9332 | 4KB | 128KB* | 128KB* | 256KB* | 256KB* |
 | 2364 | 8KB | 128KB* | 128KB* | 256KB* | 256KB* |
 | 4764 | 8KB | 128KB* | 128KB* | 256KB* | 256KB* |
 | MCM68364 | 8KB | 128KB* | 128KB* | 256KB* | 256KB* |
@@ -165,7 +164,6 @@ Some greater pin count ROMs can be emulated by a smaller One ROM, provided the R
 | 27C64 | 8KB | 256KB* | 32KB* |
 | 27LC64 | 8KB | 256KB* | 32KB* |
 | 28C64 | 8KB | 256KB* | 32KB* |
-| 23128 | 16KB | 256KB* | 32KB* |
 | 27128 | 16KB | 256KB* | 32KB* |
 | 27C128 | 16KB | 256KB* | 32KB* |
 | 27LC128 | 16KB | 256KB* | 32KB* |
@@ -191,11 +189,10 @@ Some greater pin count ROMs can be emulated by a smaller One ROM, provided the R
 | Chip | ROM size | 32A | 32B |
 |:---|---:|---:|---:|
 | 2704 | 512B | 32KB* | 4KB* |
+| HM7641 | 512B | 32KB* | - |
 | 2708 | 1KB | 64KB* | 8KB* |
-| 2316 | 2KB | 256KB* | 32KB* |
 | 2716 | 2KB | 256KB* | 32KB* |
 | 28C16 | 2KB | 256KB* | 32KB* |
-| 9316 | 2KB | 256KB* | 32KB* |
 | 2732 | 4KB | 256KB* | 32KB* |
 | 27C32 | 4KB | 256KB* | 32KB* |
 
@@ -223,6 +220,17 @@ Some greater pin count ROMs can be emulated by a smaller One ROM, provided the R
 
 Full chip list for each board. Where a particular ROM type goes by multiple identifiers (for example 27512, 27C512, 27SF512), each type appears as a separate row.
 
+The **Fit** column says how the chip sits in the board's socket:
+
+| Fit | Meaning |
+|:---|:---|
+| `native` | Chip and board have the same pin count — it goes straight in |
+| `overhang` | Chip has *fewer* pins than the board, so One ROM's top pins hang out of the socket |
+| `larger socket (no fly-leads)` | Chip has *more* pins than the board, but no address line among the extra ones: One ROM sits in the bottom of the socket with nothing to wire |
+| `fly-lead to X1` (and `X2`) | Chip has more pins than the board, and the overhanging address line(s) must be wired to One ROM's X1 (and X2) header pin |
+
+Every fit other than `native` is a cross-size fit, and in all of them One ROM's power pins may not line up with the socket's — power must be rerouted to One ROM's own VCC or 5V header pin. `larger socket (no fly-leads)` means no *signal* wiring is needed; it does not mean the chip simply drops in.
+
 ## One ROM Fire 24 (rev A/A2) — fire-24-a
 
 *24-pin chips (native)*
@@ -230,11 +238,13 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
 | 2704 | 512B | 2KB | native |
+| HM7641 | 512B | 2KB | native |
 | 2708 | 1KB | 4KB | native |
 | 2316 | 2KB | 32KB | native |
 | 2716 | 2KB | 32KB | native |
 | 28C16 | 2KB | 32KB | native |
 | 9316 | 2KB | 32KB | native |
+| 9316A | 2KB | 32KB | native |
 | 2332 | 4KB | 64KB | native |
 | 2732 | 4KB | 32KB | native |
 | 27C32 | 4KB | 32KB | native |
@@ -265,11 +275,13 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
 | 2704 | 512B | 2KB | native |
+| HM7641 | 512B | 2KB | native |
 | 2708 | 1KB | 4KB | native |
 | 2316 | 2KB | 32KB | native |
 | 2716 | 2KB | 32KB | native |
 | 28C16 | 2KB | 32KB | native |
 | 9316 | 2KB | 32KB | native |
+| 9316A | 2KB | 32KB | native |
 | 2332 | 4KB | 64KB | native |
 | 2732 | 4KB | 32KB | native |
 | 27C32 | 4KB | 32KB | native |
@@ -306,6 +318,7 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | 2716 | 2KB | 2KB | native |
 | 28C16 | 2KB | 2KB | native |
 | 9316 | 2KB | 2KB | native |
+| 9316A | 2KB | 2KB | native |
 | 2332 | 4KB | 8KB | native |
 | 2732 | 4KB | 4KB | native |
 | 27C32 | 4KB | 4KB | native |
@@ -342,6 +355,7 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | 2716 | 2KB | 2KB | native |
 | 28C16 | 2KB | 2KB | native |
 | 9316 | 2KB | 2KB | native |
+| 9316A | 2KB | 2KB | native |
 | 2332 | 4KB | 8KB | native |
 | 2732 | 4KB | 4KB | native |
 | 27C32 | 4KB | 4KB | native |
@@ -378,6 +392,7 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | 2716 | 2KB | 2KB | native |
 | 28C16 | 2KB | 2KB | native |
 | 9316 | 2KB | 2KB | native |
+| 9316A | 2KB | 2KB | native |
 | 2332 | 4KB | 8KB | native |
 | 2732 | 4KB | 4KB | native |
 | 27C32 | 4KB | 4KB | native |
@@ -414,6 +429,7 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | 2716 | 2KB | 2KB | native |
 | 28C16 | 2KB | 2KB | native |
 | 9316 | 2KB | 2KB | native |
+| 9316A | 2KB | 2KB | native |
 | 2332 | 4KB | 8KB | native |
 | 2732 | 4KB | 4KB | native |
 | 27C32 | 4KB | 4KB | native |
@@ -476,15 +492,10 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 |:---|---:|---:|:---|
 | 2704 | 512B | 4KB | overhang |
 | 2708 | 1KB | 16KB | overhang |
-| 2316 | 2KB | 32KB | overhang |
 | 2716 | 2KB | 32KB | overhang |
 | 28C16 | 2KB | 32KB | overhang |
-| 9316 | 2KB | 32KB | overhang |
-| 2332 | 4KB | 128KB | overhang |
 | 2732 | 4KB | 32KB | overhang |
 | 27C32 | 4KB | 32KB | overhang |
-| 4732 | 4KB | 128KB | overhang |
-| 9332 | 4KB | 128KB | overhang |
 | 2364 | 8KB | 128KB | overhang |
 | 4764 | 8KB | 128KB | overhang |
 | MCM68364 | 8KB | 128KB | overhang |
@@ -498,7 +509,7 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
-| 28C512 | 64KB | 64KB | no fly-leads required |
+| 28C512 | 64KB | 64KB | larger socket (no fly-leads) |
 
 ## One ROM Fire 28 (rev B) — fire-28-b
 
@@ -539,15 +550,10 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 |:---|---:|---:|:---|
 | 2704 | 512B | 4KB | overhang |
 | 2708 | 1KB | 16KB | overhang |
-| 2316 | 2KB | 32KB | overhang |
 | 2716 | 2KB | 32KB | overhang |
 | 28C16 | 2KB | 32KB | overhang |
-| 9316 | 2KB | 32KB | overhang |
-| 2332 | 4KB | 128KB | overhang |
 | 2732 | 4KB | 32KB | overhang |
 | 27C32 | 4KB | 32KB | overhang |
-| 4732 | 4KB | 128KB | overhang |
-| 9332 | 4KB | 128KB | overhang |
 | 2364 | 8KB | 128KB | overhang |
 | 4764 | 8KB | 128KB | overhang |
 | MCM68364 | 8KB | 128KB | overhang |
@@ -561,7 +567,7 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
-| 28C512 | 64KB | 64KB | no fly-leads required |
+| 28C512 | 64KB | 64KB | larger socket (no fly-leads) |
 
 ## One ROM Fire 28 (rev C) — fire-28-c
 
@@ -601,16 +607,12 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
 | 2704 | 512B | 4KB | overhang |
+| HM7641 | 512B | 4KB | overhang |
 | 2708 | 1KB | 8KB | overhang |
-| 2316 | 2KB | 32KB | overhang |
 | 2716 | 2KB | 32KB | overhang |
 | 28C16 | 2KB | 32KB | overhang |
-| 9316 | 2KB | 32KB | overhang |
-| 2332 | 4KB | 256KB | overhang |
 | 2732 | 4KB | 32KB | overhang |
 | 27C32 | 4KB | 32KB | overhang |
-| 4732 | 4KB | 256KB | overhang |
-| 9332 | 4KB | 256KB | overhang |
 | 2364 | 8KB | 256KB | overhang |
 | 4764 | 8KB | 256KB | overhang |
 | MCM68364 | 8KB | 256KB | overhang |
@@ -624,7 +626,7 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
-| 28C512 | 64KB | 64KB | no fly-leads required |
+| 28C512 | 64KB | 64KB | larger socket (no fly-leads) |
 | 23C1010 | 128KB | 128KB | fly-lead to X1 |
 | 27C010 | 128KB | 128KB | fly-lead to X1 |
 | 27C1000A | 128KB | 128KB | fly-lead to X1 |
@@ -671,16 +673,12 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
 | 2704 | 512B | 4KB | overhang |
+| HM7641 | 512B | 4KB | overhang |
 | 2708 | 1KB | 8KB | overhang |
-| 2316 | 2KB | 32KB | overhang |
 | 2716 | 2KB | 32KB | overhang |
 | 28C16 | 2KB | 32KB | overhang |
-| 9316 | 2KB | 32KB | overhang |
-| 2332 | 4KB | 256KB | overhang |
 | 2732 | 4KB | 32KB | overhang |
 | 27C32 | 4KB | 32KB | overhang |
-| 4732 | 4KB | 256KB | overhang |
-| 9332 | 4KB | 256KB | overhang |
 | 2364 | 8KB | 256KB | overhang |
 | 4764 | 8KB | 256KB | overhang |
 | MCM68364 | 8KB | 256KB | overhang |
@@ -694,7 +692,7 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
-| 28C512 | 64KB | 64KB | no fly-leads required |
+| 28C512 | 64KB | 64KB | larger socket (no fly-leads) |
 | 23C1010 | 128KB | 128KB | fly-lead to X1 |
 | 27C010 | 128KB | 128KB | fly-lead to X1 |
 | 27C1000A | 128KB | 128KB | fly-lead to X1 |
@@ -738,7 +736,6 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | 27C64 | 8KB | 256KB | overhang |
 | 27LC64 | 8KB | 256KB | overhang |
 | 28C64 | 8KB | 256KB | overhang |
-| 23128 | 16KB | 256KB | overhang |
 | 27128 | 16KB | 256KB | overhang |
 | 27C128 | 16KB | 256KB | overhang |
 | 27LC128 | 16KB | 256KB | overhang |
@@ -764,11 +761,10 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | Chip | ROM size | Image size | Fit |
 |:---|---:|---:|:---|
 | 2704 | 512B | 32KB | overhang |
+| HM7641 | 512B | 32KB | overhang |
 | 2708 | 1KB | 64KB | overhang |
-| 2316 | 2KB | 256KB | overhang |
 | 2716 | 2KB | 256KB | overhang |
 | 28C16 | 2KB | 256KB | overhang |
-| 9316 | 2KB | 256KB | overhang |
 | 2732 | 4KB | 256KB | overhang |
 | 27C32 | 4KB | 256KB | overhang |
 
@@ -812,7 +808,6 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 | 27C64 | 8KB | 32KB | overhang |
 | 27LC64 | 8KB | 32KB | overhang |
 | 28C64 | 8KB | 32KB | overhang |
-| 23128 | 16KB | 32KB | overhang |
 | 27128 | 16KB | 32KB | overhang |
 | 27C128 | 16KB | 32KB | overhang |
 | 27LC128 | 16KB | 32KB | overhang |
@@ -839,10 +834,8 @@ Full chip list for each board. Where a particular ROM type goes by multiple iden
 |:---|---:|---:|:---|
 | 2704 | 512B | 4KB | overhang |
 | 2708 | 1KB | 8KB | overhang |
-| 2316 | 2KB | 32KB | overhang |
 | 2716 | 2KB | 32KB | overhang |
 | 28C16 | 2KB | 32KB | overhang |
-| 9316 | 2KB | 32KB | overhang |
 | 2732 | 4KB | 32KB | overhang |
 | 27C32 | 4KB | 32KB | overhang |
 
