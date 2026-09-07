@@ -16,6 +16,15 @@ TINYUSB_DIR   := tinyusb
 PICOBOOTX_DIR := picobootx
 PICO_SDKLESS_DIR := pico-sdkless
 
+# Versions of the three cloned dependencies to build against.  Remove the
+# directory in question after changing one, so it is re-cloned.
+#
+# tinyusb is a commit rather than a tag, because the fork tracks a project this
+# one does not version.
+PICOBOOTX_VERSION ?= v0.2.0
+PICO_SDKLESS_VERSION ?= v0.1.1
+TINYUSB_COMMIT ?= 8e4f5c1d2
+
 ORA_DIR := ../../../firmware/ora
 ORA_INCLUDE := -I$(ORA_DIR)
 SDRR_INCLUDE := -I../../../firmware/include -I../../../firmware/generated
@@ -24,13 +33,14 @@ PLUGIN_INCLUDE := -I.
 
 BUILD_DIR := build
 
-$(shell [ -d $(TINYUSB_DIR) ] || git clone https://github.com/piersfinlayson/tinyusb.git $(TINYUSB_DIR))
+$(shell [ -d $(TINYUSB_DIR) ] || git clone --filter=blob:none https://github.com/piersfinlayson/tinyusb.git $(TINYUSB_DIR))
+$(shell git -c advice.detachedHead=false -C $(TINYUSB_DIR) checkout --quiet $(TINYUSB_COMMIT))
 include tinyusb.mk
 
-$(shell [ -d $(PICOBOOTX_DIR) ] || git clone https://github.com/piersfinlayson/picobootx.git $(PICOBOOTX_DIR))
+$(shell [ -d $(PICOBOOTX_DIR) ] || git -c advice.detachedHead=false clone --depth 1 --branch $(PICOBOOTX_VERSION) https://github.com/piersfinlayson/picobootx.git $(PICOBOOTX_DIR))
 include picobootx/picobootx.mk
 
-$(shell [ -d $(PICO_SDKLESS_DIR) ] || git clone https://github.com/piersfinlayson/pico-sdkless.git $(PICO_SDKLESS_DIR))
+$(shell [ -d $(PICO_SDKLESS_DIR) ] || git -c advice.detachedHead=false clone --depth 1 --branch $(PICO_SDKLESS_VERSION) https://github.com/piersfinlayson/pico-sdkless.git $(PICO_SDKLESS_DIR))
 
 PICOBOOTX_SRC_C := $(addprefix picobootx/,$(PICOBOOTX_SRC_C))
 PICOBOOTX_INCLUDE_DIRS := $(addprefix picobootx/,$(PICOBOOTX_INCLUDE_DIRS))
